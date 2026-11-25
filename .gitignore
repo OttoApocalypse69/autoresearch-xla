@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Autoresearch runtime artifacts (untracked by design — results.tsv survives git reset!)
+run.log
+results.tsv
+experiments.jsonl
+best_train.py
+progress.png
+.autoresearch_state.json
+
+# Caches & checkpoints
+.cache/
+jax_cache/
+checkpoints/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Secrets
+.env
+*.key

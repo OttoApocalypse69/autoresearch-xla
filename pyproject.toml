@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoresearch-xla"
+version = "0.1.0"
+description = "Autonomous LLM pretraining research loop in pure JAX/XLA for Google Colab & Kaggle GPUs and TPUs (inspired by karpathy/autoresearch)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# NOTE: `jax` is intentionally in optional-dependencies so installing this package
+# on Google Colab or Kaggle NEVER overwrites pre-matched GPU/TPU jaxlib + libtpu wheels.
+dependencies = [
+    "numpy>=1.26.0",
+    "pyarrow>=15.0.0",
+    "requests>=2.31.0",
+    "tiktoken>=0.7.0",
+    "tokenizers>=0.19.0",
+]
+
+[project.optional-dependencies]
+cpu = ["jax>=0.4.30"]
+cuda12 = ["jax[cuda12]>=0.4.30"]
+tpu = ["jax[tpu]>=0.4.30"]
+rustbpe = ["rustbpe>=0.1.0"]
+plot = ["matplotlib>=3.8.0"]
+dev = ["jax>=0.4.30", "matplotlib>=3.8.0", "pytest>=8.0.0"]
+
+[tool.setuptools]
+py-modules = ["prepare", "train", "agent"]
