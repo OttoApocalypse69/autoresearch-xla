@@ -342,3 +342,135 @@ def test_fused_chunked_ce_exact_gradients_and_remat_policies():
         )
         assert max_unscaled_diff < tol, f"Grad mismatch for {dtype}: {max_unscaled_diff}"
 
+
+def test_multi_dataset_mixer_parsing_and_cursor_resume(tmp_path):
+    from scale.data import (
+        DATASET_MIX_PRESETS,
+        DataCursor,
+        StreamingDataLoader,
+        ensure_tokenizer,
+        parse_dataset_mix,
+    )
+
+    for preset_name in ("mix-1b", "mix-cooldown", "mix-code"):
+        pairs = parse_dataset_mix(preset_name)
+        assert len(pairs) >= 3
+        assert abs(sum(w for _, w in pairs) - 1.0) < 1e-6
+        assert pairs[0][0] == "climbmix"
+        assert preset_name in DATASET_MIX_PRESETS
+
+    custom = parse_dataset_mix("climbmix:65,codeparrot:15,finemath:10,cosmopedia:10")
+    assert len(custom) == 4
+    assert abs(custom[0][1] - 0.65) < 1e-6 and abs(custom[1][1] - 0.15) < 1e-6
+
+    # Offline end-to-end mixed streaming + multi-source DataCursor round-trip
+    tok_dir = str(tmp_path / "tok")
+    cache_dir = str(tmp_path / "shards")
+    tok = ensure_tokenizer(tok_dir, vocab_size=512, dataset="synthetic:0.7,synthetic:0.3", shard_cache_dir=cache_dir)
+    loader1 = StreamingDataLoader(
+        tokenizer=tok,
+        dataset="synthetic:0.7,synthetic:0.3",
+        split="train",
+        batch_size=2,
+        seq_len=64,
+        grad_accum_steps=1,
+        shard_cache_dir=cache_dir,
+        buffer_size=32,
+        prefetch=1,
+    )
+    try:
+        x1, y1, cur1 = next(loader1)
+        assert x1.shape == (1, 2, 64) and y1.shape == (1, 2, 64)
+        assert cur1.sources is not None
+        assert "synthetic" in cur1.sources and "synthetic#1" in cur1.sources
+        assert cur1.mix_step > 0
+        saved = cur1.to_dict()
+    finally:
+        loader1.close()
+
+    # Restore cursor and confirm loader resumes cleanly from saved multi-source state
+    restored = DataCursor.from_dict(saved)
+    assert restored.mix_step == cur1.mix_step
+    assert restored.sources == cur1.sources
+    loader2 = StreamingDataLoader(
+        tokenizer=tok,
+        dataset="synthetic:0.7,synthetic:0.3",
+        split="train",
+        batch_size=2,
+        seq_len=64,
+        grad_accum_steps=1,
+        shard_cache_dir=cache_dir,
+        cursor=restored,
+        buffer_size=32,
+        prefetch=1,
+    )
+    try:
+        x2, _, cur2 = next(loader2)
+        assert x2.shape == (1, 2, 64)
+        assert cur2.mix_step >= restored.mix_step
+    finally:
+        loader2.close()
+
+
+def test_stochastic_rounding_unbiased_and_quant_training_modes():
+    import jax
+    import jax.numpy as jnp
+    from scale.model import forward_scalar_loss_and_z, init_params, precompute_rotary_embeddings
+    from scale.optimizer import init_opt_state, optimizer_step
+    from scale.quant import stochastic_round_bf16
+
+    # 1. Verify BF16 stochastic rounding is unbiased for both positive & negative tiny updates
+    key = jax.random.PRNGKey(42)
+    for target in (1.0005, -1.0005, 0.00123, -0.00123):
+        arr = jnp.full((50_000,), target, dtype=jnp.float32)
+        rounded = stochastic_round_bf16(arr, key)
+        assert rounded.dtype == jnp.bfloat16
+        mean_val = float(jnp.mean(rounded.astype(jnp.float32)))
+        assert abs(mean_val - target) < 3e-4, f"SR biased for {target}: got {mean_val}"
+
+    # 2. Verify INT8, INT8-all, FP8 qdot + pure-BF16+SR weights + muon_vmap + scan_unroll=2
+    rng = np.random.default_rng(11)
+    x = jnp.asarray(rng.integers(0, 128, size=(2, 32), dtype=np.int32))
+    y = jnp.asarray(rng.integers(0, 128, size=(2, 32), dtype=np.int32))
+    cos, sin = precompute_rotary_embeddings(32, 32)
+
+    for qmode, p_dt, use_vmap in [
+        ("int8", "bfloat16", True),
+        ("int8-all", "bfloat16", False),
+        ("fp8", "float32", False),
+    ]:
+        spec = ModelSpec(
+            sequence_len=32, vocab_size=128, n_layer=4, n_embd=64, n_head=2, n_kv_head=1,
+            mlp_hidden=128, activation="swiglu", loss_chunk_size=16,
+            remat_policy="save_all_compute", matmul_quant=qmode, scan_unroll=2,
+        )
+        tcfg = TrainConfig(
+            param_dtype=p_dt, opt_dtype="bfloat16", muon_vmap=use_vmap, matrix_lr=0.05, embedding_lr=0.3
+        )
+        param_dtype = jnp.bfloat16 if p_dt == "bfloat16" else jnp.float32
+        params = init_params(jax.random.PRNGKey(3), spec, param_dtype=param_dtype)
+        opt_state = init_opt_state(params, opt_dtype=jnp.bfloat16)
+
+        @jax.jit
+        def step_fn(p, st):
+            def loss_fn(p_in):
+                tot, ce, _ = forward_scalar_loss_and_z(p_in, x, y, cos, sin, spec, jnp.bfloat16, scale=jnp.float32(1.0))
+                return tot, ce
+
+            (_, ce), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
+            p_next, st_next, gnorm = optimizer_step(
+                p, grads, st,
+                jnp.float32(1.0), jnp.float32(0.9), jnp.float32(0.0),
+                spec, tcfg, jnp.bfloat16,
+            )
+            return p_next, st_next, ce, gnorm
+
+        losses = []
+        for _ in range(3):
+            params, opt_state, ce, gnorm = step_fn(params, opt_state)
+            assert np.isfinite(float(ce)) and np.isfinite(float(gnorm))
+            assert params["blocks"]["w_qkv"].dtype == param_dtype
+            losses.append(float(ce))
+        assert losses[-1] < losses[0], f"Loss did not decrease for {qmode}/{p_dt}: {losses}"
+
+

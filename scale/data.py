@@ -31,16 +31,176 @@ CLIMBMIX_BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuf
 CLIMBMIX_MAX_TRAIN_SHARDS = 6542  # shard_00000 .. shard_06541 are train
 CLIMBMIX_VAL_SHARD = 6542         # shard_06542 is pinned validation
 
+FINEMATH_BASE_URL = "https://huggingface.co/datasets/HuggingFaceTB/finemath/resolve/main/finemath-4plus"
+FINEMATH_MAX_SHARDS = 64          # train-00000-of-00064.parquet (~286 MB each, ~10B math tokens)
+
+COSMOPEDIA_BASE_URL = "https://huggingface.co/datasets/HuggingFaceTB/smollm-corpus/resolve/main/cosmopedia-v2"
+COSMOPEDIA_MAX_SHARDS = 104       # train-00000-of-00104.parquet (~1.17 GB each, ~28B textbook tokens)
+
+FINEWEB_EDU_BASE_URL = "https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu/resolve/main/sample/10BT"
+FINEWEB_EDU_MAX_SHARDS = 14       # 000_00000.parquet .. 013_00000.parquet
+
+CODEPARROT_BASE_URL = "https://huggingface.co/api/datasets/codeparrot/codeparrot-clean/parquet/default/train"
+CODEPARROT_MAX_SHARDS = 10        # 0.parquet .. 9.parquet (~187 MB each, clean deduplicated Python)
+
+STACK_CODE_BASE_URL = "https://huggingface.co/api/datasets/bigcode/the-stack-smol-xl/parquet/default/train"
+STACK_CODE_MAX_SHARDS = 10        # 0.parquet .. 9.parquet (~151 MB each, multi-language code)
+
 TINYSTORIES_TRAIN_URLS = [
     "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/data/train-00000-of-00004-2d5a1467fff1081b.parquet",
     "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/data/train-00001-of-00004-5852b56a2bd28fd9.parquet",
-    "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/data/train-00002-of-00004-a26307300439e943.parquet",
+    "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/data/train-00002-of-00004-a2630730439e943.parquet",
     "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/data/train-00003-of-00004-d243063613e5a057.parquet",
 ]
 TINYSTORIES_VAL_URL = (
     "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/data/"
     "validation-00000-of-00001-869c898b519ad725.parquet"
 )
+
+KNOWN_SOURCES = (
+    "climbmix",
+    "codeparrot",
+    "stack-code",
+    "finemath",
+    "cosmopedia",
+    "fineweb-edu",
+    "tinystories",
+    "synthetic",
+)
+
+# Curated multi-domain 1B mixtures (all public, ungated direct Parquet, Kaggle-disk-safe!)
+DATASET_MIX_PRESETS: dict[str, list[tuple[str, float]]] = {
+    # Flagship 1B stable-phase mixture: broad web/STEM + Python code + clean math + synthetic textbooks
+    "mix-1b": [
+        ("climbmix", 0.65),
+        ("codeparrot", 0.15),
+        ("finemath", 0.10),
+        ("cosmopedia", 0.10),
+    ],
+    # High-density WSD decay cooldown mixture (final ~2-4B tokens while annealing LR to 0)
+    "mix-cooldown": [
+        ("climbmix", 0.40),
+        ("cosmopedia", 0.20),
+        ("finemath", 0.20),
+        ("codeparrot", 0.20),
+    ],
+    # Coding-heavy 1B mixture (Python + multi-language Stack + math + ClimbMix)
+    "mix-code": [
+        ("climbmix", 0.50),
+        ("codeparrot", 0.25),
+        ("stack-code", 0.15),
+        ("finemath", 0.10),
+    ],
+}
+
+
+def parse_dataset_mix(dataset_spec: str) -> list[tuple[str, float]]:
+    """
+    Parse a dataset name, curated mix preset (`mix-1b`, `mix-cooldown`, `mix-code`),
+    or inline weighted mix spec (`climbmix:0.65,codeparrot:0.15,finemath:0.10,cosmopedia:0.10`)
+    into a normalized list of `(source_name, weight)` tuples summing to 1.0.
+    """
+    spec = dataset_spec.strip()
+    if spec in DATASET_MIX_PRESETS:
+        pairs = list(DATASET_MIX_PRESETS[spec])
+    elif spec in KNOWN_SOURCES:
+        pairs = [(spec, 1.0)]
+    elif ":" in spec or "," in spec:
+        pairs = []
+        for token in spec.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if ":" in token:
+                name, w_str = token.split(":", 1)
+                w = float(w_str.strip())
+            else:
+                name, w = token, 1.0
+            name = name.strip()
+            if name not in KNOWN_SOURCES:
+                raise ValueError(f"Unknown dataset source {name!r}. Known sources: {KNOWN_SOURCES}")
+            if w <= 0.0:
+                raise ValueError(f"Dataset weight for {name!r} must be > 0, got {w}")
+            pairs.append((name, w))
+        if not pairs:
+            raise ValueError(f"Empty dataset mix specification: {dataset_spec!r}")
+    else:
+        raise ValueError(
+            f"Unknown dataset {dataset_spec!r}. Choose a source {KNOWN_SOURCES}, "
+            f"preset {tuple(DATASET_MIX_PRESETS)}, or inline 'src1:w1,src2:w2'."
+        )
+
+    total_w = sum(w for _, w in pairs)
+    return [(name, w / total_w) for name, w in pairs]
+
+
+def _source_text_column(source: str) -> str:
+    return "content" if source in ("codeparrot", "stack-code") else "text"
+
+
+def _source_num_shards(source: str, synthetic_paths: Optional[tuple[list[str], str]] = None) -> int:
+    if source == "synthetic":
+        assert synthetic_paths is not None
+        return len(synthetic_paths[0])
+    if source == "tinystories":
+        return len(TINYSTORIES_TRAIN_URLS)
+    if source == "finemath":
+        return FINEMATH_MAX_SHARDS
+    if source == "cosmopedia":
+        return COSMOPEDIA_MAX_SHARDS
+    if source == "fineweb-edu":
+        return FINEWEB_EDU_MAX_SHARDS
+    if source == "codeparrot":
+        return CODEPARROT_MAX_SHARDS
+    if source == "stack-code":
+        return STACK_CODE_MAX_SHARDS
+    return CLIMBMIX_MAX_TRAIN_SHARDS
+
+
+def _source_shard_path_and_url(
+    source: str,
+    shard_idx: int,
+    split: str,
+    shard_cache_dir: str,
+    synthetic_paths: Optional[tuple[list[str], str]] = None,
+) -> tuple[str, Optional[str]]:
+    if source == "synthetic":
+        assert synthetic_paths is not None
+        if split == "val":
+            return synthetic_paths[1], None
+        return synthetic_paths[0][shard_idx % len(synthetic_paths[0])], None
+    if source == "tinystories":
+        if split == "val":
+            return os.path.join(shard_cache_dir, "ts_val.parquet"), TINYSTORIES_VAL_URL
+        idx = shard_idx % len(TINYSTORIES_TRAIN_URLS)
+        return os.path.join(shard_cache_dir, f"ts_train_{idx:02d}.parquet"), TINYSTORIES_TRAIN_URLS[idx]
+    if split == "val":
+        # Pin all general/mixed datasets to ClimbMix's held-out shard_06542 for apples-to-apples val_bpb
+        fn = f"shard_{CLIMBMIX_VAL_SHARD:05d}.parquet"
+        return os.path.join(shard_cache_dir, fn), f"{CLIMBMIX_BASE_URL}/{fn}"
+    if source == "finemath":
+        idx = shard_idx % FINEMATH_MAX_SHARDS
+        fn = f"train-{idx:05d}-of-{FINEMATH_MAX_SHARDS:05d}.parquet"
+        return os.path.join(shard_cache_dir, f"finemath_{fn}"), f"{FINEMATH_BASE_URL}/{fn}"
+    if source == "cosmopedia":
+        idx = shard_idx % COSMOPEDIA_MAX_SHARDS
+        fn = f"train-{idx:05d}-of-{COSMOPEDIA_MAX_SHARDS:05d}.parquet"
+        return os.path.join(shard_cache_dir, f"cosmopedia_{fn}"), f"{COSMOPEDIA_BASE_URL}/{fn}"
+    if source == "fineweb-edu":
+        idx = shard_idx % FINEWEB_EDU_MAX_SHARDS
+        fn = f"{idx:03d}_00000.parquet"
+        return os.path.join(shard_cache_dir, f"finewebedu_{fn}"), f"{FINEWEB_EDU_BASE_URL}/{fn}"
+    if source == "codeparrot":
+        idx = shard_idx % CODEPARROT_MAX_SHARDS
+        return os.path.join(shard_cache_dir, f"codeparrot_{idx:02d}.parquet"), f"{CODEPARROT_BASE_URL}/{idx}.parquet"
+    if source == "stack-code":
+        idx = shard_idx % STACK_CODE_MAX_SHARDS
+        return os.path.join(shard_cache_dir, f"stackcode_{idx:02d}.parquet"), f"{STACK_CODE_BASE_URL}/{idx}.parquet"
+    # climbmix
+    idx = shard_idx % CLIMBMIX_MAX_TRAIN_SHARDS
+    fn = f"shard_{idx:05d}.parquet"
+    return os.path.join(shard_cache_dir, fn), f"{CLIMBMIX_BASE_URL}/{fn}"
+
 
 SPLIT_PATTERN = (
     r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}|"""
@@ -63,21 +223,55 @@ BOS_TOKEN = "<|bos|>"
 
 @dataclass
 class DataCursor:
+    """Exact resumable streaming cursor for both single-source and multi-source dataset mixes."""
+
     shard_idx: int = 0
     row_group_idx: int = 0
     epoch: int = 1
+    sources: Optional[dict[str, dict]] = None
+    mix_step: int = 0
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d: dict = {
+            "shard_idx": int(self.shard_idx),
+            "row_group_idx": int(self.row_group_idx),
+            "epoch": int(self.epoch),
+        }
+        if self.sources is not None:
+            d["sources"] = {
+                k: {
+                    "shard_idx": int(v.get("shard_idx", 0)),
+                    "row_group_idx": int(v.get("row_group_idx", 0)),
+                    "epoch": int(v.get("epoch", 1)),
+                }
+                for k, v in self.sources.items()
+            }
+            d["mix_step"] = int(self.mix_step)
+        return d
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "DataCursor":
         if not d:
             return cls()
+        raw_sources = d.get("sources")
+        sources = (
+            {
+                str(k): {
+                    "shard_idx": int(v.get("shard_idx", 0)),
+                    "row_group_idx": int(v.get("row_group_idx", 0)),
+                    "epoch": int(v.get("epoch", 1)),
+                }
+                for k, v in raw_sources.items()
+            }
+            if isinstance(raw_sources, dict)
+            else None
+        )
         return cls(
             shard_idx=int(d.get("shard_idx", 0)),
             row_group_idx=int(d.get("row_group_idx", 0)),
             epoch=int(d.get("epoch", 1)),
+            sources=sources,
+            mix_step=int(d.get("mix_step", 0)),
         )
 
 
@@ -90,9 +284,9 @@ def _download_file(url: str, filepath: str, max_attempts: int = 5) -> str:
         return filepath
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     for attempt in range(1, max_attempts + 1):
-        tmp_path = filepath + f".tmp.{os.getpid()}"
+        tmp_path = f"{filepath}.tmp.{os.getpid()}.{threading.get_ident()}"
         try:
-            with requests.get(url, stream=True, timeout=60) as resp:
+            with requests.get(url, stream=True, timeout=60, allow_redirects=True) as resp:
                 resp.raise_for_status()
                 with open(tmp_path, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=1024 * 1024):
@@ -101,12 +295,11 @@ def _download_file(url: str, filepath: str, max_attempts: int = 5) -> str:
             os.replace(tmp_path, filepath)
             return filepath
         except (requests.RequestException, OSError) as exc:
-            for p in (tmp_path, filepath):
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
             if attempt == max_attempts:
                 raise RuntimeError(f"Failed downloading {url}: {exc}") from exc
             time.sleep(min(2**attempt, 16))
@@ -249,43 +442,49 @@ def ensure_tokenizer(
     os.makedirs(tokenizer_dir, exist_ok=True)
     os.makedirs(shard_cache_dir, exist_ok=True)
 
-    # Fetch 1-2 initial shards for tokenizer training
-    if dataset == "synthetic":
-        train_paths, _ = _ensure_synthetic_shards(shard_cache_dir)
-    elif dataset == "tinystories":
-        train_paths = [
-            _download_file(TINYSTORIES_TRAIN_URLS[i], os.path.join(shard_cache_dir, f"ts_train_{i:02d}.parquet"))
-            for i in range(min(train_shards, len(TINYSTORIES_TRAIN_URLS)))
-        ]
-    else:
-        train_paths = [
-            _download_file(
-                f"{CLIMBMIX_BASE_URL}/shard_{i:05d}.parquet",
-                os.path.join(shard_cache_dir, f"shard_{i:05d}.parquet"),
-            )
-            for i in range(train_shards)
-        ]
+    mix = parse_dataset_mix(dataset)
+    synthetic_paths = _ensure_synthetic_shards(shard_cache_dir) if any(s == "synthetic" for s, _ in mix) else None
+
+    # Fetch 1 initial shard per source (up to `train_shards` for single-source) so BPE merges
+    # reflect every domain in the mixture (prose + Python code + LaTeX math!)
+    source_files: list[tuple[str, float, list[str]]] = []
+    for src, weight in mix:
+        n_fetch = min(train_shards, _source_num_shards(src, synthetic_paths)) if len(mix) == 1 else 1
+        paths = []
+        for i in range(n_fetch):
+            fp, url = _source_shard_path_and_url(src, i, "train", shard_cache_dir, synthetic_paths)
+            if url is not None and not os.path.exists(fp):
+                _download_file(url, fp)
+            paths.append(fp)
+        source_files.append((src, weight, paths))
 
     def text_iter(max_chars: int = 400_000_000, doc_cap: int = 10_000):
-        nchars = 0
-        for fp in train_paths:
-            pf = pq.ParquetFile(fp)
-            for rg_idx in range(pf.num_row_groups):
-                for txt in pf.read_row_group(rg_idx).column("text").to_pylist():
-                    if not txt:
-                        continue
-                    doc = txt[:doc_cap] if len(txt) > doc_cap else txt
-                    nchars += len(doc)
-                    yield doc
-                    if nchars >= max_chars:
-                        return
+        for src, weight, paths in source_files:
+            col = _source_text_column(src)
+            src_budget = max(1_000_000, int(max_chars * weight))
+            nchars = 0
+            for fp in paths:
+                pf = pq.ParquetFile(fp)
+                for rg_idx in range(pf.num_row_groups):
+                    for txt in pf.read_row_group(rg_idx, columns=[col]).column(col).to_pylist():
+                        if not txt:
+                            continue
+                        doc = txt[:doc_cap] if len(txt) > doc_cap else txt
+                        nchars += len(doc)
+                        yield doc
+                        if nchars >= src_budget:
+                            break
+                    if nchars >= src_budget:
+                        break
+                if nchars >= src_budget:
+                    break
 
     t0 = time.time()
     try:
         import rustbpe
         import tiktoken
 
-        print(f"[Tokenizer] Training {vocab_size:,}-vocab BPE via rustbpe + tiktoken...")
+        print(f"[Tokenizer] Training {vocab_size:,}-vocab BPE via rustbpe + tiktoken on {dataset}...")
         bpe = rustbpe.Tokenizer()
         bpe.train_from_iterator(text_iter(), vocab_size - len(SPECIAL_TOKENS), pattern=SPLIT_PATTERN)
         mergeable = {bytes(k): v for k, v in bpe.get_mergeable_ranks()}
@@ -309,7 +508,7 @@ def ensure_tokenizer(
         from tokenizers import Tokenizer as HFTokenizer
         from tokenizers import decoders, models, pre_tokenizers, trainers
 
-        print(f"[Tokenizer] Training {vocab_size:,}-vocab ByteLevel BPE via HF tokenizers...")
+        print(f"[Tokenizer] Training {vocab_size:,}-vocab ByteLevel BPE via HF tokenizers on {dataset}...")
         hf_tok = HFTokenizer(models.BPE())
         hf_tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
         hf_tok.decoder = decoders.ByteLevel()
@@ -346,13 +545,113 @@ def load_token_bytes(tokenizer_dir: str) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Disk-Bounded Streaming Shard Loader with Exact Resumable DataCursor
+# Disk-Bounded Single & Multi-Source Streaming Loader with Resumable Cursor
 # ---------------------------------------------------------------------------
+
+class _SingleSourceStream:
+    """Disk-bounded streaming parquet reader for one dataset source."""
+
+    def __init__(
+        self,
+        source: str,
+        split: str,
+        shard_cache_dir: str,
+        keep_shards: int,
+        start_state: dict,
+        stop_event: threading.Event,
+        synthetic_paths: Optional[tuple[list[str], str]] = None,
+    ):
+        self.source = source
+        self.split = split
+        self.shard_cache_dir = shard_cache_dir
+        # Large secondary sources cap at 1 rolling shard on disk to stay well within Kaggle's 20 GB limit
+        self.keep_shards = 1 if source in ("cosmopedia", "fineweb-edu") else max(1, keep_shards)
+        self.stop_event = stop_event
+        self.synthetic_paths = synthetic_paths
+        self.text_col = _source_text_column(source)
+        self.n_shards = _source_num_shards(source, synthetic_paths) if split == "train" else 1
+        self.state = {
+            "shard_idx": int(start_state.get("shard_idx", 0)) % self.n_shards,
+            "row_group_idx": int(start_state.get("row_group_idx", 0)),
+            "epoch": int(start_state.get("epoch", 1)),
+        }
+        self._prefetch_threads: dict[int, threading.Thread] = {}
+
+    def _ensure_shard(self, shard_idx: int) -> str:
+        path, url = _source_shard_path_and_url(
+            self.source, shard_idx, self.split, self.shard_cache_dir, self.synthetic_paths
+        )
+        if url is not None and not os.path.exists(path):
+            _download_file(url, path)
+        return path
+
+    def _kick_prefetch(self, shard_idx: int) -> None:
+        if self.source == "synthetic" or self.split == "val":
+            return
+        path, url = _source_shard_path_and_url(
+            self.source, shard_idx, self.split, self.shard_cache_dir, self.synthetic_paths
+        )
+        if url is None or os.path.exists(path) or shard_idx in self._prefetch_threads:
+            return
+
+        def dl():
+            try:
+                _download_file(url, path)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=dl, daemon=True)
+        self._prefetch_threads[shard_idx] = t
+        t.start()
+
+    def _cleanup_old(self, shard_idx: int) -> None:
+        if self.source in ("synthetic", "tinystories") or self.split == "val" or self.keep_shards <= 0:
+            return
+        old_idx = shard_idx - (self.keep_shards - 1)
+        if old_idx < 0:
+            return
+        old_path, _ = _source_shard_path_and_url(
+            self.source, old_idx, self.split, self.shard_cache_dir, self.synthetic_paths
+        )
+        if os.path.exists(old_path):
+            try:
+                os.remove(old_path)
+            except OSError:
+                pass
+        self._prefetch_threads.pop(old_idx, None)
+
+    def doc_batches(self, doc_batch_size: int = 128):
+        shard_idx = self.state["shard_idx"]
+        start_rg = self.state["row_group_idx"]
+        epoch = self.state["epoch"]
+
+        while not self.stop_event.is_set():
+            if self.split == "train" and self.n_shards > 1:
+                self._kick_prefetch((shard_idx + 1) % self.n_shards)
+
+            fp = self._ensure_shard(shard_idx)
+            pf = pq.ParquetFile(fp)
+            for rg_idx in range(start_rg, pf.num_row_groups):
+                if self.stop_event.is_set():
+                    return
+                texts = pf.read_row_group(rg_idx, columns=[self.text_col]).column(self.text_col).to_pylist()
+                self.state = {"shard_idx": shard_idx, "row_group_idx": rg_idx, "epoch": epoch}
+                for i in range(0, len(texts), doc_batch_size):
+                    yield texts[i : i + doc_batch_size]
+
+            start_rg = 0
+            self._cleanup_old(shard_idx)
+            shard_idx += 1
+            if shard_idx >= self.n_shards:
+                shard_idx = 0
+                epoch += 1
+
 
 class StreamingDataLoader:
     """
-    Streams parquet shards with a bounded rolling disk footprint (`keep_shards`),
-    BOS-aligned best-fit packing, background prefetching, and an exact resumable cursor.
+    Streams single-source or multi-source mixed Parquet shards with bounded rolling disk
+    footprint (`keep_shards`), deterministic smooth weighted mixing, BOS-aligned best-fit
+    packing, background prefetching, and an exact resumable `DataCursor`.
     """
 
     def __init__(
@@ -381,112 +680,94 @@ class StreamingDataLoader:
         self.buffer_size = buffer_size
         self.prefetch = prefetch
 
+        self.mix = parse_dataset_mix(dataset)
+        if split == "val":
+            # Single pinned validation source: synthetic/tinystories for toy runs, climbmix for all real mixes
+            if all(s == "synthetic" for s, _ in self.mix):
+                val_src = "synthetic"
+            elif all(s == "tinystories" for s, _ in self.mix):
+                val_src = "tinystories"
+            else:
+                val_src = "climbmix"
+            self.mix = [(val_src, 1.0)]
+
         os.makedirs(self.shard_cache_dir, exist_ok=True)
         self._cursor = DataCursor.from_dict(cursor.to_dict() if cursor else None)
         self._stop = threading.Event()
         self._queue: queue.Queue = queue.Queue(maxsize=max(1, prefetch))
-        self._prefetch_threads: dict[int, threading.Thread] = {}
         self._synthetic_paths: Optional[tuple[list[str], str]] = None
-        if dataset == "synthetic":
+        if any(src == "synthetic" for src, _ in self.mix):
             self._synthetic_paths = _ensure_synthetic_shards(shard_cache_dir)
 
         self._worker = threading.Thread(target=self._run_worker, daemon=True)
         self._worker.start()
 
-    def _num_train_shards(self) -> int:
-        if self.dataset == "synthetic":
-            assert self._synthetic_paths is not None
-            return len(self._synthetic_paths[0])
-        if self.dataset == "tinystories":
-            return len(TINYSTORIES_TRAIN_URLS)
-        return CLIMBMIX_MAX_TRAIN_SHARDS
-
-    def _shard_path_and_url(self, shard_idx: int) -> tuple[str, Optional[str]]:
-        if self.dataset == "synthetic":
-            assert self._synthetic_paths is not None
-            if self.split == "val":
-                return self._synthetic_paths[1], None
-            return self._synthetic_paths[0][shard_idx % len(self._synthetic_paths[0])], None
-        if self.dataset == "tinystories":
-            if self.split == "val":
-                return os.path.join(self.shard_cache_dir, "ts_val.parquet"), TINYSTORIES_VAL_URL
-            idx = shard_idx % len(TINYSTORIES_TRAIN_URLS)
-            return os.path.join(self.shard_cache_dir, f"ts_train_{idx:02d}.parquet"), TINYSTORIES_TRAIN_URLS[idx]
-        # ClimbMix
-        if self.split == "val":
-            fn = f"shard_{CLIMBMIX_VAL_SHARD:05d}.parquet"
-            return os.path.join(self.shard_cache_dir, fn), f"{CLIMBMIX_BASE_URL}/{fn}"
-        idx = shard_idx % CLIMBMIX_MAX_TRAIN_SHARDS
-        fn = f"shard_{idx:05d}.parquet"
-        return os.path.join(self.shard_cache_dir, fn), f"{CLIMBMIX_BASE_URL}/{fn}"
-
-    def _ensure_shard(self, shard_idx: int) -> str:
-        path, url = self._shard_path_and_url(shard_idx)
-        if url is not None and not os.path.exists(path):
-            _download_file(url, path)
-        return path
-
-    def _kick_prefetch_shard(self, shard_idx: int) -> None:
-        if self.dataset == "synthetic" or self.split == "val":
-            return
-        path, url = self._shard_path_and_url(shard_idx)
-        if url is None or os.path.exists(path) or shard_idx in self._prefetch_threads:
-            return
-
-        def dl():
-            try:
-                _download_file(url, path)
-            except Exception:
-                pass
-
-        t = threading.Thread(target=dl, daemon=True)
-        self._prefetch_threads[shard_idx] = t
-        t.start()
-
-    def _cleanup_old_shard(self, shard_idx: int) -> None:
-        """Delete consumed ClimbMix training shards to stay strictly within Kaggle's disk cap."""
-        if self.dataset != "climbmix" or self.split == "val":
-            return
-        if self.keep_shards <= 0:
-            return
-        old_idx = shard_idx - (self.keep_shards - 1)
-        if old_idx < 0:
-            return
-        old_path, _ = self._shard_path_and_url(old_idx)
-        if os.path.exists(old_path):
-            try:
-                os.remove(old_path)
-            except OSError:
-                pass
-        self._prefetch_threads.pop(old_idx, None)
-
     def _doc_batch_stream(self, doc_batch_size: int = 128):
-        n_shards = self._num_train_shards() if self.split == "train" else 1
-        shard_idx = self._cursor.shard_idx % n_shards
-        start_rg = self._cursor.row_group_idx
-        epoch = self._cursor.epoch
+        if len(self.mix) == 1:
+            src = self.mix[0][0]
+            start_st = (
+                self._cursor.sources.get(src, {})
+                if self._cursor.sources
+                else {"shard_idx": self._cursor.shard_idx, "row_group_idx": self._cursor.row_group_idx, "epoch": self._cursor.epoch}
+            )
+            reader = _SingleSourceStream(
+                src, self.split, self.shard_cache_dir, self.keep_shards, start_st, self._stop, self._synthetic_paths
+            )
+            for batch in reader.doc_batches(doc_batch_size):
+                st = reader.state
+                yield batch, DataCursor(shard_idx=st["shard_idx"], row_group_idx=st["row_group_idx"], epoch=st["epoch"])
+            return
+
+        # Multi-source deterministic smooth weighted deficit scheduler (zero-variance exact ratios!)
+        readers: list[_SingleSourceStream] = []
+        weights: list[float] = []
+        keys: list[str] = []
+        # Deduplicate duplicate source names cleanly in cursor keys (e.g. synthetic:0.6,synthetic:0.4)
+        seen_counts: dict[str, int] = {}
+        saved_sources = self._cursor.sources or {}
+        for src, w in self.mix:
+            cnt = seen_counts.get(src, 0)
+            seen_counts[src] = cnt + 1
+            key = src if cnt == 0 else f"{src}#{cnt}"
+            start_st = saved_sources.get(key, {"shard_idx": cnt, "row_group_idx": 0, "epoch": 1})
+            readers.append(
+                _SingleSourceStream(
+                    src, self.split, self.shard_cache_dir, self.keep_shards, start_st, self._stop, self._synthetic_paths
+                )
+            )
+            weights.append(w)
+            keys.append(key)
+
+        iters = [r.doc_batches(doc_batch_size) for r in readers]
+        credits = [0.0] * len(readers)
+        mix_step = int(self._cursor.mix_step)
+        # Fast-forward smooth deficit credits deterministically to `mix_step` on resume
+        for _ in range(mix_step % 10000):
+            for i, w in enumerate(weights):
+                credits[i] += w
+            pick = max(range(len(weights)), key=lambda i: credits[i])
+            credits[pick] -= 1.0
 
         while not self._stop.is_set():
-            # Prefetch next shard while we consume the current one
-            if self.split == "train" and n_shards > 1:
-                self._kick_prefetch_shard((shard_idx + 1) % n_shards)
+            for i, w in enumerate(weights):
+                credits[i] += w
+            pick = max(range(len(weights)), key=lambda i: credits[i])
+            credits[pick] -= 1.0
+            mix_step += 1
 
-            fp = self._ensure_shard(shard_idx)
-            pf = pq.ParquetFile(fp)
-            for rg_idx in range(start_rg, pf.num_row_groups):
-                if self._stop.is_set():
-                    return
-                texts = pf.read_row_group(rg_idx).column("text").to_pylist()
-                cursor_snap = DataCursor(shard_idx=shard_idx, row_group_idx=rg_idx, epoch=epoch)
-                for i in range(0, len(texts), doc_batch_size):
-                    yield texts[i : i + doc_batch_size], cursor_snap
-
-            start_rg = 0
-            self._cleanup_old_shard(shard_idx)
-            shard_idx += 1
-            if shard_idx >= n_shards:
-                shard_idx = 0
-                epoch += 1
+            try:
+                batch = next(iters[pick])
+            except StopIteration:
+                return
+            primary = readers[0].state
+            snap = DataCursor(
+                shard_idx=primary["shard_idx"],
+                row_group_idx=primary["row_group_idx"],
+                epoch=primary["epoch"],
+                sources={keys[i]: dict(readers[i].state) for i in range(len(readers))},
+                mix_step=mix_step,
+            )
+            yield batch, snap
 
     def _run_worker(self) -> None:
         try:

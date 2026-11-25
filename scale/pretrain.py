@@ -64,6 +64,7 @@ from scale.data import (
     StreamingDataLoader,
     ensure_tokenizer,
     evaluate_val_bpb,
+    parse_dataset_mix,
 )
 from scale.fsdp import build_tree_shardings, create_fsdp_mesh, summarize_sharding
 from scale.model import (
@@ -143,10 +144,14 @@ def _build_train_step(
         out_shardings=(param_shardings, opt_shardings, replicated, replicated, replicated, replicated),
     )
     def train_step(p, st, x_steps, y_steps, lrm, muon_mom, muon_wd, loss_scale):
-        # Megatron/MaxText mixed precision: cast fp32 master weights to bf16 ONCE before
-        # micro-step accumulation -> halves weight HBM reads AND halves micro-grad buffers!
+        # Megatron/MaxText mixed precision: if master weights are fp32, cast to bf16 ONCE before
+        # micro-step accumulation (2x smaller FSDP AllGather/ReduceScatter & micro-grads).
+        # If master weights are already bf16 (--param-dtype bfloat16 + SR), zero copy & zero cast!
         use_bf16_w = compute_dtype == jnp.bfloat16
-        p_work = jax.tree_util.tree_map(lambda a: a.astype(jnp.bfloat16), p) if use_bf16_w else p
+        if use_bf16_w and tcfg.param_dtype != "bfloat16":
+            p_work = jax.tree_util.tree_map(lambda a: a.astype(jnp.bfloat16), p)
+        else:
+            p_work = p
         acc_dtype = jnp.bfloat16 if (tcfg.opt_dtype == "bfloat16" and use_bf16_w) else jnp.float32
 
         if grad_accum_steps == 1:
@@ -194,6 +199,7 @@ def run_benchmark(spec: ModelSpec, tcfg: TrainConfig, warmup_steps: int = 2, tim
     """
     hw = detect_hardware()
     dtype_name, compute_dtype = _resolve_compute_dtype(tcfg, hw.compute_dtype)
+    param_dtype = jnp.bfloat16 if tcfg.param_dtype == "bfloat16" else jnp.float32
     opt_dtype = jnp.bfloat16 if tcfg.opt_dtype == "bfloat16" else jnp.float32
     use_loss_scale = compute_dtype == jnp.float16
     ns_dtype = jnp.bfloat16 if compute_dtype == jnp.bfloat16 else jnp.float32
@@ -211,12 +217,13 @@ def run_benchmark(spec: ModelSpec, tcfg: TrainConfig, warmup_steps: int = 2, tim
     grad_accum_steps = total_batch_size // tokens_per_micro
 
     key = jax.random.PRNGKey(tcfg.seed)
-    abs_p = jax.eval_shape(functools.partial(init_params, spec=spec), key)
+    init_p_fn = functools.partial(init_params, spec=spec, param_dtype=param_dtype)
+    abs_p = jax.eval_shape(init_p_fn, key)
     abs_o = jax.eval_shape(functools.partial(init_opt_state, opt_dtype=opt_dtype), abs_p)
     param_shardings = build_tree_shardings(abs_p, mesh, use_fsdp=tcfg.use_fsdp)
     opt_shardings = build_tree_shardings(abs_o, mesh, use_fsdp=tcfg.use_fsdp)
 
-    params = jax.jit(functools.partial(init_params, spec=spec), out_shardings=param_shardings)(key)
+    params = jax.jit(init_p_fn, out_shardings=param_shardings)(key)
     opt_state = jax.jit(
         functools.partial(init_opt_state, opt_dtype=opt_dtype),
         in_shardings=(param_shardings,),
@@ -234,7 +241,8 @@ def run_benchmark(spec: ModelSpec, tcfg: TrainConfig, warmup_steps: int = 2, tim
 
     print(
         f"[Bench] {hw.device_kind} x{hw.num_devices} ({hw.platform}, {dtype_name}, peak={hw.peak_tflops_total:.1f} TFLOPS) | "
-        f"attn={attn_used} | remat={spec.remat_policy} | ce_chunk={spec.loss_chunk_size} | opt={tcfg.opt_dtype}"
+        f"attn={attn_used} | remat={spec.remat_policy} | quant={spec.matmul_quant} | unroll={spec.scan_unroll} | "
+        f"p={tcfg.param_dtype} | opt={tcfg.opt_dtype} | muon={'vmap' if tcfg.muon_vmap else 'scan'}"
     )
     print(
         f"[Bench] {p_counts['total']/1e6:.2f}M params | FSDP: {p_sh['per_device_mb']:.0f}MB p + {o_sh['per_device_mb']:.0f}MB opt/dev | "
@@ -293,10 +301,13 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
     t_session_start = time.time()
     hw = detect_hardware()
     dtype_name, compute_dtype = _resolve_compute_dtype(tcfg, hw.compute_dtype)
+    param_dtype = jnp.bfloat16 if tcfg.param_dtype == "bfloat16" else jnp.float32
     opt_dtype = jnp.bfloat16 if tcfg.opt_dtype == "bfloat16" else jnp.float32
     use_loss_scale = compute_dtype == jnp.float16
     ns_dtype = jnp.bfloat16 if compute_dtype == jnp.bfloat16 else jnp.float32
     attn_used = resolve_attn_backend(spec.attn_impl)
+    mix_pairs = parse_dataset_mix(tcfg.dataset)
+    mix_desc = ", ".join(f"{src}:{w*100:.0f}%" for src, w in mix_pairs)
 
     mesh = create_fsdp_mesh()
     replicated = NamedSharding(mesh, P())
@@ -322,9 +333,10 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
 
     print(
         f"[Scale] Hardware: {hw.device_kind} x{hw.num_devices} "
-        f"(platform={hw.platform}, compute={dtype_name}, opt={tcfg.opt_dtype}, "
-        f"attn={attn_used}, remat={spec.remat_policy}, fsdp={tcfg.use_fsdp}, peak={hw.peak_tflops_total:.1f} TFLOPS)"
+        f"(platform={hw.platform}, compute={dtype_name}, param={tcfg.param_dtype}, opt={tcfg.opt_dtype}, "
+        f"attn={attn_used}, remat={spec.remat_policy}, quant={spec.matmul_quant}, fsdp={tcfg.use_fsdp}, peak={hw.peak_tflops_total:.1f} TFLOPS)"
     )
+    print(f"[Scale] Dataset:  {tcfg.dataset} ({mix_desc})")
 
     if tcfg.resume and tcfg.sync_backend != "none" and tcfg.remote_target:
         try:
@@ -344,7 +356,8 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
     )
 
     key = jax.random.PRNGKey(tcfg.seed)
-    abstract_params = jax.eval_shape(functools.partial(init_params, spec=spec), key)
+    init_p_fn = functools.partial(init_params, spec=spec, param_dtype=param_dtype)
+    abstract_params = jax.eval_shape(init_p_fn, key)
     abstract_opt = jax.eval_shape(functools.partial(init_opt_state, opt_dtype=opt_dtype), abstract_params)
     param_shardings = build_tree_shardings(abstract_params, mesh, use_fsdp=tcfg.use_fsdp)
     opt_shardings = build_tree_shardings(abstract_opt, mesh, use_fsdp=tcfg.use_fsdp)
@@ -378,7 +391,7 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
             f"best_val_bpb={best_val_bpb:.4f} | cursor=shard {cursor.shard_idx} rg {cursor.row_group_idx} ep {cursor.epoch}"
         )
     else:
-        params = jax.jit(functools.partial(init_params, spec=spec), out_shardings=param_shardings)(key)
+        params = jax.jit(init_p_fn, out_shardings=param_shardings)(key)
         opt_state = jax.jit(
             functools.partial(init_opt_state, opt_dtype=opt_dtype),
             in_shardings=(param_shardings,),
@@ -697,14 +710,33 @@ def main() -> None:
     )
     parser.add_argument("--attn-impl", choices=["auto", "splash", "cudnn", "xla"], default=None)
     parser.add_argument("--loss-chunk-size", type=int, default=None, help="Chunked CE token count (0=off, 2048=default)")
-    parser.add_argument("--splash-block-size", type=int, default=None, help="TPU SplashAttention tile size (128/256/512)")
-    parser.add_argument("--dataset", choices=["climbmix", "tinystories", "synthetic"], default="climbmix")
+    parser.add_argument("--splash-block-size", type=int, default=None, help="TPU SplashAttention tile size (512/1024)")
+    parser.add_argument(
+        "--matmul-quant",
+        choices=["none", "int8", "int8-all", "fp8"],
+        default=None,
+        help="Experimental dynamic INT8/FP8 quantized linear GEMMs",
+    )
+    parser.add_argument("--scan-unroll", type=int, default=None, help="jax.lax.scan unroll factor (1 or 2)")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="climbmix",
+        help="Source (climbmix/codeparrot/finemath/cosmopedia/...), mix preset (mix-1b/mix-cooldown/mix-code), or inline 'src:w,...'",
+    )
     parser.add_argument("--total-tokens", type=int, default=20_000_000_000, help="Target total training tokens")
     parser.add_argument("--total-batch-size", type=int, default=524_288, help="Global tokens per optimizer step")
     parser.add_argument("--per-device-batch", type=int, default=4, help="Microbatch sequences per chip")
     parser.add_argument("--eval-tokens", type=int, default=4 * 524_288, help="Validation tokens per eval")
     parser.add_argument("--compute-dtype", choices=["auto", "bfloat16", "float16", "float32"], default="auto")
+    parser.add_argument(
+        "--param-dtype",
+        choices=["float32", "bfloat16"],
+        default="float32",
+        help="Master weight precision (bfloat16 uses unbiased stochastic rounding and cuts weight HBM ~3x)",
+    )
     parser.add_argument("--opt-dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--muon-vmap", action="store_true", help="Batch Muon across layers via vmap (faster on v5e-8 / G4)")
     parser.add_argument("--no-fsdp", action="store_true", help="Disable FSDP parameter sharding (replicate instead)")
     parser.add_argument("--phase", choices=["stable", "decay"], default="stable", help="WSD schedule phase")
     parser.add_argument("--warmup-steps", type=int, default=500)
@@ -728,6 +760,9 @@ def main() -> None:
     parser.add_argument("--bench-steps", type=int, default=8, help="Timed steps for --benchmark-only")
     args = parser.parse_args()
 
+    # Validate dataset / mix string immediately before allocating accelerators
+    parse_dataset_mix(args.dataset)
+
     arch_overrides = json.loads(Path(args.arch_config).read_text(encoding="utf-8")) if args.arch_config else {}
     if args.remat_policy is not None:
         arch_overrides["remat_policy"] = args.remat_policy
@@ -737,6 +772,10 @@ def main() -> None:
         arch_overrides["loss_chunk_size"] = args.loss_chunk_size
     if args.splash_block_size is not None:
         arch_overrides["splash_block_size"] = args.splash_block_size
+    if args.matmul_quant is not None:
+        arch_overrides["matmul_quant"] = args.matmul_quant
+    if args.scan_unroll is not None:
+        arch_overrides["scan_unroll"] = args.scan_unroll
 
     spec = get_model_preset(args.preset, arch_overrides=arch_overrides or None)
 
@@ -748,7 +787,9 @@ def main() -> None:
         total_batch_size=args.total_batch_size,
         per_device_batch=args.per_device_batch,
         compute_dtype=args.compute_dtype,
+        param_dtype=args.param_dtype,
         opt_dtype=args.opt_dtype,
+        muon_vmap=args.muon_vmap,
         use_fsdp=not args.no_fsdp,
         matrix_lr=args.matrix_lr,
         embedding_lr=args.embedding_lr,

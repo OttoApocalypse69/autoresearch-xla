@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 
 from scale.config import ModelSpec, TrainConfig
+from scale.quant import stochastic_round_bf16
 
 POLAR_EXPRESS_COEFFS = (
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
@@ -54,21 +55,32 @@ def init_opt_state(params: dict, opt_dtype=jnp.float32) -> dict:
     return state
 
 
-def _adamw_update(p, g, st, step_f, lr, beta1, beta2, eps=1e-10, wd=0.0):
+def _cast_updated_param(p_new_f32: jax.Array, orig_dtype, sr_key: jax.Array) -> jax.Array:
+    if orig_dtype == jnp.bfloat16:
+        return stochastic_round_bf16(p_new_f32, sr_key)
+    return p_new_f32.astype(orig_dtype)
+
+
+def _adamw_update(p, g, st, step_f, lr, beta1, beta2, sr_key, eps=1e-10, wd=0.0):
+    orig_dtype = p.dtype
     opt_dtype = st["m"].dtype
+    p_f = p.astype(jnp.float32)
     g_f = g.astype(jnp.float32)
     m = st["m"].astype(jnp.float32) * beta1 + g_f * (1.0 - beta1)
     v = st["v"].astype(jnp.float32) * beta2 + (g_f * g_f) * (1.0 - beta2)
     bias1 = 1.0 - (beta1**step_f)
     bias2 = 1.0 - (beta2**step_f)
     denom = jnp.sqrt(v / bias2) + eps
-    p_new = p * (1.0 - lr * wd) - (lr / bias1) * (m / denom)
+    p_new_f = p_f * (1.0 - lr * wd) - (lr / bias1) * (m / denom)
+    p_new = _cast_updated_param(p_new_f, orig_dtype, sr_key)
     return p_new, {"m": m.astype(opt_dtype), "v": v.astype(opt_dtype)}
 
 
-def _muon_update_2d(p, g, m_buf, v_buf, lr, momentum, wd, ns_dtype, beta2, ns_steps):
-    """Single 2D matrix Polar-Express NorMuon update with cautious weight decay."""
+def _muon_update_2d(p, g, m_buf, v_buf, sr_key, lr, momentum, wd, ns_dtype, beta2, ns_steps):
+    """Single 2D matrix Polar-Express NorMuon update with cautious weight decay (+ BF16 SR if needed)."""
+    orig_dtype = p.dtype
     opt_dtype = m_buf.dtype
+    p_f = p.astype(jnp.float32)
     g_f = g.astype(jnp.float32)
     m = m_buf.astype(jnp.float32) * momentum + g_f * (1.0 - momentum)
     u = g_f * (1.0 - momentum) + m * momentum
@@ -107,21 +119,34 @@ def _muon_update_2d(p, g, m_buf, v_buf, lr, momentum, wd, ns_dtype, beta2, ns_st
     g_orth = g_orth * final_scale
 
     eff_lr = lr * (max(1.0, cols / rows) ** 0.5)
-    mask = ((g_orth * p) >= 0.0).astype(jnp.float32)
-    p_new = p - eff_lr * g_orth - eff_lr * wd * p * mask
+    mask = ((g_orth * p_f) >= 0.0).astype(jnp.float32)
+    p_new_f = p_f - eff_lr * g_orth - eff_lr * wd * p_f * mask
+    p_new = _cast_updated_param(p_new_f, orig_dtype, sr_key)
     return p_new, m.astype(opt_dtype), v_new
 
 
-def _muon_update_scanned(p_3d, g_3d, st_3d, lr, momentum, wd, ns_dtype, beta2, ns_steps):
-    """Apply NorMuon across stacked `(n_layer, rows, cols)` one layer at a time via lax.scan."""
+def _muon_update_blocks(p_3d, g_3d, st_3d, base_key, lr, momentum, wd, ns_dtype, beta2, ns_steps, use_vmap: bool):
+    """Apply NorMuon across stacked `(n_layer, rows, cols)` via low-HBM scan or batched vmap."""
+    n_layer = p_3d.shape[0]
+    layer_keys = jax.random.split(base_key, n_layer)
+
+    if use_vmap:
+        def fn(p_i, g_i, m_i, v_i, k_i):
+            return _muon_update_2d(p_i, g_i, m_i, v_i, k_i, lr, momentum, wd, ns_dtype, beta2, ns_steps)
+
+        p_out, m_out, v_out = jax.vmap(fn)(p_3d, g_3d, st_3d["m"], st_3d["v_rowcol"], layer_keys)
+        return p_out, {"m": m_out, "v_rowcol": v_out}
+
     def body(_, inputs):
-        p_i, g_i, m_i, v_i = inputs
+        p_i, g_i, m_i, v_i, k_i = inputs
         p_new, m_new, v_new = _muon_update_2d(
-            p_i, g_i, m_i, v_i, lr, momentum, wd, ns_dtype, beta2, ns_steps
+            p_i, g_i, m_i, v_i, k_i, lr, momentum, wd, ns_dtype, beta2, ns_steps
         )
         return None, (p_new, m_new, v_new)
 
-    _, (p_out, m_out, v_out) = jax.lax.scan(body, None, (p_3d, g_3d, st_3d["m"], st_3d["v_rowcol"]))
+    _, (p_out, m_out, v_out) = jax.lax.scan(
+        body, None, (p_3d, g_3d, st_3d["m"], st_3d["v_rowcol"], layer_keys)
+    )
     return p_out, {"m": m_out, "v_rowcol": v_out}
 
 
@@ -147,7 +172,7 @@ def optimizer_step(
     tcfg: TrainConfig,
     ns_dtype,
 ):
-    """Full Muon + AdamW update with global gradient clipping and width-scaled AdamW LRs."""
+    """Full Muon + AdamW update with global gradient clipping, width-scaled LRs, and optional BF16 SR."""
     grads, grad_norm = clip_grads_by_global_norm(grads, tcfg.grad_clip)
 
     step_i = opt_state["step"] + jnp.int32(1)
@@ -155,45 +180,55 @@ def optimizer_step(
     b1, b2 = tcfg.adam_beta1, tcfg.adam_beta2
     dmodel_scale = (spec.n_embd / 768.0) ** -0.5
 
+    # Deterministic per-step PRNG key for unbiased BF16 stochastic rounding (no-op for fp32 params)
+    sr_root = jax.random.fold_in(jax.random.PRNGKey(tcfg.seed), step_i)
+
+    def next_sr_key():
+        nonlocal sr_root
+        sr_root, sub = jax.random.split(sr_root)
+        return sub
+
     new_params: dict = {}
     new_state: dict = {"step": step_i}
 
     new_params["wte"], new_state["wte"] = _adamw_update(
         params["wte"], grads["wte"], opt_state["wte"], step_f,
-        tcfg.embedding_lr * dmodel_scale * lrm, b1, b2,
+        tcfg.embedding_lr * dmodel_scale * lrm, b1, b2, next_sr_key(),
     )
     if "lm_head" in params:
         new_params["lm_head"], new_state["lm_head"] = _adamw_update(
             params["lm_head"], grads["lm_head"], opt_state["lm_head"], step_f,
-            tcfg.unembedding_lr * dmodel_scale * lrm, b1, b2,
+            tcfg.unembedding_lr * dmodel_scale * lrm, b1, b2, next_sr_key(),
         )
     if "value_embeds" in params:
         new_params["value_embeds"], new_state["value_embeds"] = _adamw_update(
             params["value_embeds"], grads["value_embeds"], opt_state["value_embeds"], step_f,
-            tcfg.embedding_lr * dmodel_scale * lrm, b1, b2,
+            tcfg.embedding_lr * dmodel_scale * lrm, b1, b2, next_sr_key(),
         )
 
     new_params["resid_lambdas"], new_state["resid_lambdas"] = _adamw_update(
         params["resid_lambdas"], grads["resid_lambdas"], opt_state["resid_lambdas"], step_f,
-        tcfg.scalar_lr * 0.01 * lrm, b1, b2,
+        tcfg.scalar_lr * 0.01 * lrm, b1, b2, next_sr_key(),
     )
     new_params["x0_lambdas"], new_state["x0_lambdas"] = _adamw_update(
         params["x0_lambdas"], grads["x0_lambdas"], opt_state["x0_lambdas"], step_f,
-        tcfg.scalar_lr * lrm, 0.96, 0.95,
+        tcfg.scalar_lr * lrm, 0.96, 0.95, next_sr_key(),
     )
 
     new_blocks, st_blocks = {}, {}
     for name in params["blocks"]:
-        new_blocks[name], st_blocks[name] = _muon_update_scanned(
+        new_blocks[name], st_blocks[name] = _muon_update_blocks(
             params["blocks"][name],
             grads["blocks"][name],
             opt_state["blocks"][name],
+            next_sr_key(),
             tcfg.matrix_lr * lrm,
             muon_momentum,
             muon_wd,
             ns_dtype,
             tcfg.muon_beta2,
             tcfg.muon_ns_steps,
+            use_vmap=tcfg.muon_vmap,
         )
     new_params["blocks"] = new_blocks
     new_state["blocks"] = st_blocks

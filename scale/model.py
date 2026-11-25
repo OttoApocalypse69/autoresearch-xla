@@ -29,6 +29,7 @@ from jax.sharding import Mesh
 
 from scale.attention import fused_causal_attention, resolve_attn_backend
 from scale.config import ModelSpec
+from scale.quant import qdot
 
 
 def rms_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
@@ -54,10 +55,11 @@ def apply_rotary_emb(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
     return jnp.concatenate([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], axis=-1)
 
 
-def init_params(key: jax.Array, spec: ModelSpec) -> dict:
+def init_params(key: jax.Array, spec: ModelSpec, param_dtype=jnp.float32) -> dict:
     """
-    Initialize parameters in float32 master precision with fused `(n_layer, in, out)`
-    tensors for peak MXU/Tensor-Core arithmetic intensity and clean FSDP sharding.
+    Initialize parameters in `param_dtype` (`float32` standard or `bfloat16` for pure-BF16 +
+    stochastic rounding) with fused `(n_layer, in, out)` tensors for peak MXU/Tensor-Core
+    arithmetic intensity and clean FSDP sharding. Small 1D scalars stay float32.
     """
     L = spec.n_layer
     C = spec.n_embd
@@ -73,39 +75,50 @@ def init_params(key: jax.Array, spec: ModelSpec) -> dict:
         return sub
 
     blocks: dict[str, jax.Array] = {
-        "w_qkv": jax.random.uniform(next_key(), (L, C, qkv_dim), jnp.float32, -s, s),
-        "c_proj": jnp.zeros((L, C, C), dtype=jnp.float32),
-        "mlp_down": jnp.zeros((L, M, C), dtype=jnp.float32),
+        "w_qkv": jax.random.uniform(next_key(), (L, C, qkv_dim), jnp.float32, -s, s).astype(param_dtype),
+        "c_proj": jnp.zeros((L, C, C), dtype=param_dtype),
+        "mlp_down": jnp.zeros((L, M, C), dtype=param_dtype),
     }
     if spec.activation == "swiglu":
-        blocks["w_gate_up"] = jax.random.uniform(next_key(), (L, C, 2 * M), jnp.float32, -s, s)
+        blocks["w_gate_up"] = jax.random.uniform(next_key(), (L, C, 2 * M), jnp.float32, -s, s).astype(param_dtype)
     else:
-        blocks["mlp_fc"] = jax.random.uniform(next_key(), (L, C, M), jnp.float32, -s, s)
+        blocks["mlp_fc"] = jax.random.uniform(next_key(), (L, C, M), jnp.float32, -s, s).astype(param_dtype)
 
     if spec.use_value_embeds:
-        blocks["ve_gate"] = jnp.zeros((L, ve_ch, spec.n_kv_head), dtype=jnp.float32)
+        blocks["ve_gate"] = jnp.zeros((L, ve_ch, spec.n_kv_head), dtype=param_dtype)
 
     params: dict = {
-        "wte": jax.random.normal(next_key(), (spec.vocab_size, C), dtype=jnp.float32)
-        * (C**-0.5 if spec.tie_embeddings else 1.0),
+        "wte": (
+            jax.random.normal(next_key(), (spec.vocab_size, C), dtype=jnp.float32)
+            * (C**-0.5 if spec.tie_embeddings else 1.0)
+        ).astype(param_dtype),
         "blocks": blocks,
         "resid_lambdas": jnp.ones((L,), dtype=jnp.float32),
         "x0_lambdas": jnp.full((L,), 0.1 if spec.use_resid_lambdas else 0.0, dtype=jnp.float32),
     }
     if not spec.tie_embeddings:
-        params["lm_head"] = jax.random.normal(next_key(), (C, spec.vocab_size), dtype=jnp.float32) * 0.001
+        params["lm_head"] = (
+            jax.random.normal(next_key(), (C, spec.vocab_size), dtype=jnp.float32) * 0.001
+        ).astype(param_dtype)
     if spec.use_value_embeds:
         params["value_embeds"] = jax.random.uniform(
             next_key(), (L, spec.vocab_size, kv_dim), jnp.float32, -s, s
-        )
+        ).astype(param_dtype)
     return params
+
+
+def _dots_or_named_policy(*names: str):
+    return jax.checkpoint_policies.save_from_both_policies(
+        jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+        jax.checkpoint_policies.save_only_these_names(*names),
+    )
 
 
 def _get_checkpoint_policy(remat_policy: str):
     if remat_policy == "none":
         return None
     if remat_policy == "save_all_compute":
-        return jax.checkpoint_policies.dots_with_no_batch_dims_saveable
+        return _dots_or_named_policy("qkv", "out_proj", "mlp_wi")
     if remat_policy == "save_attn":
         return jax.checkpoint_policies.save_only_these_names("qkv", "context")
     if remat_policy == "save_qkv_attn":
@@ -133,12 +146,13 @@ def _pre_attn_subblock(
     head_dim = spec.head_dim
     kv_dim = spec.kv_dim
     ve_ch = min(32, C)
+    qmode = spec.matmul_quant
 
     if spec.use_resid_lambdas:
         x = resid_lam.astype(compute_dtype) * x + x0_lam.astype(compute_dtype) * x0
 
     h = rms_norm(x)
-    qkv = jnp.dot(h.reshape(B * T, C), blk["w_qkv"].astype(compute_dtype))
+    qkv = qdot(h.reshape(B * T, C), blk["w_qkv"].astype(compute_dtype), mode=qmode)
     qkv = checkpoint_name(qkv, "qkv")
     q = qkv[:, :C].reshape(B, T, spec.n_head, head_dim)
     k = qkv[:, C : C + kv_dim].reshape(B, T, spec.n_kv_head, head_dim)
@@ -168,24 +182,27 @@ def _post_attn_mlp_subblock(
     compute_dtype,
 ) -> jax.Array:
     B, T, C = x.shape
+    qmode = spec.matmul_quant
     if spec.use_resid_lambdas:
         x = resid_lam.astype(compute_dtype) * x + x0_lam.astype(compute_dtype) * x0
 
-    y_out = jnp.dot(y.reshape(B * T, C), blk["c_proj"].astype(compute_dtype)).reshape(B, T, C)
+    y_out = qdot(y.reshape(B * T, C), blk["c_proj"].astype(compute_dtype), mode=qmode).reshape(B, T, C)
     y_out = checkpoint_name(y_out, "out_proj")
     x = x + y_out
 
     m = rms_norm(x).reshape(B * T, C)
     if spec.activation == "swiglu":
-        gu = jnp.dot(m, blk["w_gate_up"].astype(compute_dtype))
+        gu = checkpoint_name(qdot(m, blk["w_gate_up"].astype(compute_dtype), mode=qmode), "mlp_wi")
         gate, up = jnp.split(gu, 2, axis=-1)
         m = jax.nn.silu(gate) * up
     elif spec.activation == "relu2":
-        m = jnp.square(jax.nn.relu(jnp.dot(m, blk["mlp_fc"].astype(compute_dtype))))
+        fc = checkpoint_name(qdot(m, blk["mlp_fc"].astype(compute_dtype), mode=qmode), "mlp_wi")
+        m = jnp.square(jax.nn.relu(fc))
     else:  # "gelu"
-        m = jax.nn.gelu(jnp.dot(m, blk["mlp_fc"].astype(compute_dtype)), approximate=True)
+        fc = checkpoint_name(qdot(m, blk["mlp_fc"].astype(compute_dtype), mode=qmode), "mlp_wi")
+        m = jax.nn.gelu(fc, approximate=True)
 
-    mlp_out = jnp.dot(m, blk["mlp_down"].astype(compute_dtype)).reshape(B, T, C)
+    mlp_out = qdot(m, blk["mlp_down"].astype(compute_dtype), mode=qmode).reshape(B, T, C)
     return x + mlp_out
 
 
@@ -232,10 +249,10 @@ def _make_layer_fn(
     if policy_name in ("save_all_compute", "save_attn") and attn_backend in ("splash", "cudnn"):
         pre_fn = jax.checkpoint(
             functools.partial(_pre_attn_subblock, spec=spec, compute_dtype=compute_dtype),
-            policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+            policy=_dots_or_named_policy("qkv"),
         )
         post_pol = (
-            jax.checkpoint_policies.dots_with_no_batch_dims_saveable
+            _dots_or_named_policy("out_proj", "mlp_wi")
             if policy_name == "save_all_compute"
             else jax.checkpoint_policies.nothing_saveable
         )
@@ -304,7 +321,10 @@ def forward_hidden(
                 return layer_fn(blk, r_lam, x0_lam, carry_x, x0, ve_w[idx], cos_t, sin_t), None
 
             x, _ = jax.lax.scan(
-                scan_body_ve, x, (params["blocks"], params["resid_lambdas"], params["x0_lambdas"], ve_table)
+                scan_body_ve,
+                x,
+                (params["blocks"], params["resid_lambdas"], params["x0_lambdas"], ve_table),
+                unroll=spec.scan_unroll,
             )
         else:
             def scan_body_nove(carry_x, layer_inputs):
@@ -312,7 +332,10 @@ def forward_hidden(
                 return layer_fn(blk, r_lam, x0_lam, carry_x, x0, None, cos_t, sin_t), None
 
             x, _ = jax.lax.scan(
-                scan_body_nove, x, (params["blocks"], params["resid_lambdas"], params["x0_lambdas"])
+                scan_body_nove,
+                x,
+                (params["blocks"], params["resid_lambdas"], params["x0_lambdas"]),
+                unroll=spec.scan_unroll,
             )
 
     elif spec.n_layer % G == 0:
@@ -339,7 +362,9 @@ def forward_hidden(
                     cur = group_fns[g](blk_g, g_r[g], g_x0[g], cur, x0, g_ve[g][idx], cos_t, sin_t)
                 return cur, None
 
-            x, _ = jax.lax.scan(group_body_ve, x, (grouped_blocks, grouped_r, grouped_x0, grouped_ve))
+            x, _ = jax.lax.scan(
+                group_body_ve, x, (grouped_blocks, grouped_r, grouped_x0, grouped_ve), unroll=spec.scan_unroll
+            )
         else:
             def group_body_nove(carry_x, grp):
                 g_blk, g_r, g_x0 = grp
@@ -349,7 +374,9 @@ def forward_hidden(
                     cur = group_fns[g](blk_g, g_r[g], g_x0[g], cur, x0, None, cos_t, sin_t)
                 return cur, None
 
-            x, _ = jax.lax.scan(group_body_nove, x, (grouped_blocks, grouped_r, grouped_x0))
+            x, _ = jax.lax.scan(
+                group_body_nove, x, (grouped_blocks, grouped_r, grouped_x0), unroll=spec.scan_unroll
+            )
 
     else:
         for i in range(spec.n_layer):
