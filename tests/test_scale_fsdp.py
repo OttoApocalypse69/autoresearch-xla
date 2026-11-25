@@ -474,3 +474,44 @@ def test_stochastic_rounding_unbiased_and_quant_training_modes():
         assert losses[-1] < losses[0], f"Loss did not decrease for {qmode}/{p_dt}: {losses}"
 
 
+def test_splash_attention_8_device_shard_map():
+    """Verify multi-chip TPU SplashAttention shard_map (check_vma/check_rep) matches XLA forward+backward on 8 devices."""
+    code = """
+import numpy as np
+import jax
+import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from scale.attention import _splash_attention_tpu
+
+mesh = Mesh(np.array(jax.devices()), ("fsdp",))
+assert mesh.size == 8
+B, T, H, KV, D = 8, 128, 4, 2, 128
+sh = NamedSharding(mesh, P("fsdp", None, None, None))
+q = jax.device_put(jax.random.normal(jax.random.PRNGKey(0), (B, T, H, D), jnp.bfloat16) * 0.5, sh)
+k = jax.device_put(jax.random.normal(jax.random.PRNGKey(1), (B, T, KV, D), jnp.bfloat16) * 0.5, sh)
+v = jax.device_put(jax.random.normal(jax.random.PRNGKey(2), (B, T, KV, D), jnp.bfloat16) * 0.5, sh)
+
+def loss_splash(q_, k_, v_):
+    o = _splash_attention_tpu(q_, k_, v_, window_size=None, block_size=128, mesh=mesh, interpret=True)
+    return jnp.mean(o.astype(jnp.float32) ** 2)
+
+def loss_xla(q_, k_, v_):
+    o = jax.nn.dot_product_attention(q_, k_, v_, is_causal=True)
+    return jnp.mean(o.astype(jnp.float32) ** 2)
+
+v_sp, g_sp = jax.jit(jax.value_and_grad(loss_splash, argnums=(0, 1, 2)))(q, k, v)
+v_xl, g_xl = jax.jit(jax.value_and_grad(loss_xla, argnums=(0, 1, 2)))(q, k, v)
+diff_v = abs(float(v_sp) - float(v_xl))
+diff_dq = float(jnp.max(jnp.abs(g_sp[0].astype(jnp.float32) - g_xl[0].astype(jnp.float32))))
+print(f"8-dev Splash vs XLA: val_diff={diff_v:.6e}, dq_max_diff={diff_dq:.6e}")
+assert diff_v < 1e-2, f"Splash val mismatch: {diff_v}"
+assert diff_dq < 2e-2, f"Splash dq mismatch: {diff_dq}"
+"""
+    res = subprocess.run(
+        [PYTHON, "-c", code],
+        cwd=str(REPO_ROOT),
+        env={**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=8"},
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, f"8-dev SplashAttention test failed:\n{res.stdout}\n{res.stderr}"

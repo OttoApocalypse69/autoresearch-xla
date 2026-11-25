@@ -15,16 +15,19 @@ Critical numerical invariants verified:
 
 from __future__ import annotations
 
+import inspect
 from typing import Optional
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P
 
-# Cross-version shard_map (jax.shard_map in JAX >=0.8, jax.experimental.shard_map in 0.4-0.7)
+# Cross-version shard_map (jax.shard_map in JAX >=0.8 uses check_vma, legacy uses check_rep)
 _SHARD_MAP = getattr(jax, "shard_map", None)
 if _SHARD_MAP is None:
     from jax.experimental.shard_map import shard_map as _SHARD_MAP  # type: ignore
+_SHARD_MAP_PARAMS = inspect.signature(_SHARD_MAP).parameters
+_SHARD_MAP_KWARGS = {"check_vma": False} if "check_vma" in _SHARD_MAP_PARAMS else {"check_rep": False}
 
 
 def _is_ampere_or_newer_gpu(device_kind: str) -> bool:
@@ -61,6 +64,7 @@ def _splash_attention_tpu(
     window_size: Optional[tuple[int, int]],
     block_size: int = 512,
     mesh: Optional[Mesh] = None,
+    interpret: bool = False,
 ) -> jax.Array:
     """
     TPU Pallas SplashAttention for `(B, T, H, D)` Q and `(B, T, KV, D)` K, V.
@@ -107,7 +111,10 @@ def _splash_attention_tpu(
             block_q_dq=blk,
             block_kv_dq=blk,
         )
-    kernel = splash_attention.make_splash_mha_single_device(multi_mask, block_sizes=bs)
+    mk_kwargs = {"block_sizes": bs}
+    if interpret:
+        mk_kwargs["interpret"] = True
+    kernel = splash_attention.make_splash_mha_single_device(multi_mask, **mk_kwargs)
 
     # SplashAttention computes Q @ K^T without 1/sqrt(D) scaling -> pre-scale Q!
     scale = jnp.asarray(D**-0.5, dtype=q.dtype)
@@ -118,7 +125,7 @@ def _splash_attention_tpu(
     def local_fn(ql, kl, vl):
         return jax.vmap(kernel)(ql, kl, vl)
 
-    if mesh is not None and mesh.size > 1:
+    if mesh is not None and mesh.size > 1 and B % mesh.size == 0:
         axis_name = mesh.axis_names[0]
         spec = P(axis_name, None, None, None)
         out_bhtd = _SHARD_MAP(
@@ -126,7 +133,7 @@ def _splash_attention_tpu(
             mesh=mesh,
             in_specs=(spec, spec, spec),
             out_specs=spec,
-            check_rep=False,
+            **_SHARD_MAP_KWARGS,
         )(q_bhtd, k_bhtd, v_bhtd)
     else:
         out_bhtd = local_fn(q_bhtd, k_bhtd, v_bhtd)
