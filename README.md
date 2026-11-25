@@ -1,5 +1,7 @@
 # autoresearch-xla
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/OttoApocalypse69/autoresearch-xla/blob/main/autoresearch_colab_kaggle.ipynb)
+
 A pure **JAX/XLA** port of [Andrej Karpathy's `autoresearch`](https://github.com/karpathy/autoresearch) engineered to run autonomous LLM pretraining research loops on **Google Colab** and **Kaggle** across **both GPUs and TPUs** — from a free single T4 GPU up to free 8-chip Kaggle TPU `v5e-8` pods and Colab `A100` / `H100` / `v6e-1` runtimes.
 
 ## How It Works
@@ -77,6 +79,24 @@ python agent.py --provider auto --tag nov24-tpu --max-experiments 100 --max-hour
 Just like Karpathy's original `autoresearch`, open your coding agent in this directory (or inside Colab Terminal!) and prompt:
 
 > Read `program.md` and `train.py`, check that data is ready, create a fresh `autoresearch/<tag>` branch, run the baseline, and begin the autonomous experiment loop.
+
+### Option 4: Remote GPU/TPU Orchestration via Official Colab CLI & Kaggle CLI
+
+Run directly from your local terminal against remote Colab or Kaggle accelerators:
+
+```bash
+# Google Colab CLI (https://github.com/googlecolab/google-colab-cli)
+uv tool install google-colab-cli
+colab new -s autoresearch --tpu v5e1   # or --gpu T4 / L4 / A100 / H100
+colab exec -s autoresearch -f autoresearch_colab_kaggle.ipynb
+colab stop -s autoresearch             # always release the VM when finished
+
+# Official Kaggle CLI (https://github.com/Kaggle/kaggle-cli)
+uv tool install --with six kaggle
+kaggle auth login                      # or place ~/.kaggle/kaggle.json / KAGGLE_API_TOKEN
+kaggle quota                           # inspect weekly free GPU & TPU quota
+kaggle kernels push -p . --accelerator TpuV5E8   # or NvidiaTeslaT4 (2xT4 GPU)
+```
 
 ## Running the Test Suite
 
