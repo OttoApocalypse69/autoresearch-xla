@@ -763,6 +763,7 @@ def main() -> None:
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/1b")
     parser.add_argument("--shard-cache-dir", type=str, default="/tmp/autoresearch_shards")
+    parser.add_argument("--keep-shards", type=int, default=2, help="Max rolling shards kept on disk per source")
     parser.add_argument("--sync-backend", choices=["none", "local", "hf", "kaggle"], default="none")
     parser.add_argument("--remote-target", type=str, default=None, help="Drive dir, HF repo_id, or Kaggle dataset slug")
     parser.add_argument("--no-resume", action="store_true")
@@ -795,6 +796,7 @@ def main() -> None:
         total_tokens=args.total_tokens,
         eval_tokens=args.eval_tokens,
         shard_cache_dir=args.shard_cache_dir,
+        keep_shards=args.keep_shards,
         total_batch_size=args.total_batch_size,
         per_device_batch=args.per_device_batch,
         compute_dtype=args.compute_dtype,
