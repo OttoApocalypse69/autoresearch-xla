@@ -47,6 +47,7 @@ from scale.optimizer import compute_weight_decay, compute_wsd_lrm  # noqa: E402
         ("350m", 340_000_000, 390_000_000),
         ("1b", 1_000_000_000, 1_060_000_000),
         ("1b-relu2", 1_000_000_000, 1_050_000_000),
+        ("1b-ve", 1_350_000_000, 1_400_000_000),
     ],
 )
 def test_preset_exact_param_counts(preset, min_params, max_params):

@@ -158,6 +158,22 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         remat_policy="save_attn",
         loss_chunk_size=2048,
     ),
+    # ~1.37B total / 1.036B active-FLOPs autoresearch winner (ResFormer Value Embeddings + SSSL window: -0.0967 BPB on mix-1b!)
+    # Recommended optimizer flags from proxy sweep: --matrix-lr 0.04 --embedding-lr 0.4 --weight-decay 0.05
+    "1b-ve": ModelSpec(
+        sequence_len=2048,
+        vocab_size=32768,
+        n_layer=20,
+        n_embd=2048,
+        n_head=16,
+        n_kv_head=4,
+        mlp_hidden=5632,
+        activation="swiglu",
+        window_pattern="SSSL",
+        use_value_embeds=True,
+        remat_policy="save_all_compute",
+        loss_chunk_size=2048,
+    ),
 }
 
 

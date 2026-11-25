@@ -104,16 +104,17 @@ kaggle kernels push -p . --accelerator TpuV5E8   # or NvidiaTeslaT4 (2xT4 GPU)
 
 Once `autoresearch-xla` discovers a strong architecture/optimizer recipe at proxy scale, scale it up with the high-MFU resumable multi-chip **1D FSDP pretraining engine** ([`scale/pretrain.py`](scale/pretrain.py) & [`pretrain_1b_colab_kaggle.ipynb`](pretrain_1b_colab_kaggle.ipynb)):
 
-- **True 1D FSDP across 8 TPU chips / multi-GPU**: Shards 1.036B weights + NorMuon/AdamW states across 8 chips on Kaggle TPU `v5e-8` (**~1.05 GB/chip** static HBM in fp32, or **~525 MB/chip** in pure BF16+SR!) — and fits **1.036B on a single 16 GB Colab TPU `v5e-1` at `67.46%` pure-BF16 MFU (`80.25%` BF16-eq with INT8)!**
+- **True 1D FSDP across 8 TPU chips / multi-GPU**: Shards 1.036B weights + NorMuon/AdamW states across 8 chips on Kaggle TPU `v5e-8` (**~1.05 GB/chip** static HBM in fp32, or **~525 MB/chip** in pure BF16+SR!) — and fits **1.036B on a single 16 GB Colab TPU `v5e-1` at `67.46%` pure-BF16 MFU (`84.83%` BF16-eq / `24,505 tok/s` with pre-quantized INT8-ALL)!**
 - **Full MFU & Experimental Stack**:
   - Fused `w_qkv` & SwiGLU `w_gate_up` projections (all dims 256-aligned for TPU v5e/v6e MXUs & NVIDIA Tensor Cores)
-  - Auto-dispatched **Pallas TPU `SplashAttention(1024)`** (fused backward kernel + `shard_map` FSDP) & **GPU `cuDNN FlashAttention`** (also wired into proxy `train.py`!)
+  - Auto-dispatched **Pallas TPU `SplashAttention(1024)`** (fused backward kernel + cross-version `shard_map` FSDP) & **GPU `cuDNN FlashAttention`** (also wired into proxy `train.py`!)
   - **Flash/Splash-aware split rematerialization**: `save_all_compute` (0% GEMM & 0% Attention recompute, ~3× lower HBM than `none` by discarding redundant `silu`/`rms_norm` buffers) and `save_attn` (0% Attention/QKV recompute, ~7.5× lower HBM)
-  - **Single-pass FSDP Fused Cut-Cross-Entropy** (`@jax.custom_vjp`): 0% `lm_head` backward recomputation, zero cross-chip resharding, and ~16× lower logits HBM (`~268 MB` vs `4.3 GB`)
-  - **Experimental Pure-BF16 Master Weights + Unbiased Stochastic Rounding** (`--param-dtype bfloat16`, [`scale/quant.py`](scale/quant.py)): cuts 1B weight HBM by ~3× (`5.93 GB → 1.98 GB`), eliminates `fp32→bf16` staging casts, and unlocks `save_all_compute` even on a single 16 GB chip
-  - **Experimental Dynamic INT8 / FP8 Quantized GEMMs** (`--matmul-quant int8 | int8-all | fp8`): unlocks TPU `v5e`'s **394 TOPS INT8** MXU (`+20%` faster over 66.7% BF16 with `<0.0001` loss delta!) and TPU `v6e` / Blackwell `G4` FP8 Tensor Cores
+  - **Single-pass FSDP Fused Cut-Cross-Entropy** (`@jax.custom_vjp`): 0% `lm_head` backward recomputation, zero cross-chip resharding, ~16× lower logits HBM (`~268 MB` vs `4.3 GB`), plus exact-forward / **394-TOPS INT8-backward** `lm_head` in `int8-all`
+  - **Pure-BF16 Master Weights + Unbiased Stochastic Rounding** (`--param-dtype bfloat16`, [`scale/quant.py`](scale/quant.py)): cuts 1B weight HBM by ~3× (`5.93 GB → 1.98 GB`), eliminates `fp32→bf16` staging casts, and unlocks `save_all_compute` even on a single 16 GB chip
+  - **Pre-Quantized 1-Byte INT8 / FP8 Linear Engine** (`--matmul-quant int8 | int8-all | fp8`): pre-quantizes weights ONCE per step before gradient accumulation (halving weight HBM reads & multi-chip FSDP AllGather ICI traffic to 1 byte/weight!), saves 1-byte INT8 activations for `d_w`, uses reciprocal-multiply VPU quant, and runs FSDP-local `bf16` `d_w` `psum_scatter` on `v5e-8` — hitting **`84.83%` BF16-eq MFU (`24,505 tok/s`) on 1.036B** while **beating pure BF16 on live `mix-1b` `val_bpb`** (`1.807677`/`1.807863` vs `1.808011`)!
   - All 10 verified MaxText TPU `v5e-8` FSDP flags (`windowed_einsum` + backward AllGather pipelining + async collective fusion), 90% GPU VRAM preallocation, optional `--muon-vmap`, and async H2D double-buffering
-- **Disk-bounded Multi-Dataset Streaming Mixer** ([`scale/data.py`](scale/data.py)): Deterministic smooth-weighted streaming across public, ungated HF Parquet corpora with exact per-source resumable `DataCursor` and rolling `/tmp` cleanup (`< 2 GB` total disk on Kaggle's 20 GB cap!):
+  - **Autoresearch-discovered `1b-ve` preset**: Proxy sweep on live `mix-1b` (`100m`, 15.7M tokens/exp) found ResFormer Value Embeddings (`use_value_embeds=True`, zero extra GEMM FLOPs!) + `SSSL` sliding window + `--matrix-lr 0.04 --embedding-lr 0.4 --weight-decay 0.05` drops `val_bpb` by **`-0.0967` BPB** (`1.7867 → 1.6900`; `-0.0158` BPB at matched params without VE!).
+- **Disk-bounded Multi-Dataset Streaming Mixer** ([`scale/data.py`](scale/data.py)): Deterministic smooth-weighted streaming across public, ungated HF Parquet corpora with exact per-source resumable `DataCursor` and rolling `/tmp` cleanup (`~3.4 GB` live verified on `mix-1b`, safe on Kaggle's 20 GB cap!):
   - `mix-1b` *(recommended 1B stable phase)*: `65%` ClimbMix-400B + `15%` CodeParrot-Clean (Python) + `10%` FineMath-4plus + `10%` Cosmopedia-v2
   - `mix-cooldown` *(recommended WSD decay phase)*: `40%` ClimbMix + `20%` Cosmopedia-v2 + `20%` FineMath-4plus + `20%` CodeParrot
   - `mix-code`: `50%` ClimbMix + `25%` CodeParrot + `15%` The-Stack-Smol-XL + `10%` FineMath-4plus
@@ -130,31 +131,35 @@ Once `autoresearch-xla` discovers a strong architecture/optimizer recipe at prox
 | **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` `350M` (367M) | `Splash(1024)` + `save_all_compute` + Fused Cut-CE (`b=4`) | 48,059 tok/s | 59.86% (**2.06×**) |
 | **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` **`1B` (1.036B)** | `Splash(1024)` + `save_attn` + Fused Cut-CE (`fp32 w`, `bf16 opt`, `b=2`) | 18,138 tok/s | 62.79% |
 | **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` **`1B` (1.036B)** | **`BF16+SR` + `save_all_compute` + `Splash(1024)` + Fused Cut-CE (512K batch)** | **19,485 tok/s** | **67.46%** (pure BF16) |
-| **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` **`1B` (1.036B)** | **Experimental `--matmul-quant int8` (INT8 fwd/dx + BF16 dw)** | **20,870 tok/s** | **72.25%** *(BF16-eq)* |
-| **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` **`1B` (1.036B)** | **Experimental `--matmul-quant int8-all` (394 TOPS INT8 MXU)** | **23,182 tok/s** | **80.25%** *(BF16-eq)* |
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` **`1B` (1.036B)** | **Pre-quant `--matmul-quant int8` (INT8 fwd/dx + BF16 dw, 262K)** | **22,116 tok/s** | **76.56%** *(BF16-eq)* |
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` **`1B` (1.036B)** | **Pre-quant `--matmul-quant int8-all` (1B + INT8 `lm_head` bwd, 512K)** | **24,505 tok/s** | **84.83%** *(BF16-eq)* |
 | **Colab GPU `L4`** (24 GB, 121 TF) | `scale/` `350M` (367M) | Baseline (`xla` + `full` remat + unchunked CE) | 6,196 tok/s | 12.56% |
 | **Colab GPU `L4`** (24 GB, 121 TF) | `scale/` `350M` (367M) | `cuDNN FlashAttention` + `save_attn` + chunked CE (`b=8`) | 10,885 tok/s | 22.07% (**1.76×**) |
 | **Kaggle `2× T4`** (32 GB, 130 TF) | Proxy `train.py` (26.3M) | Multi-GPU SPMD `float16` + dynamic loss scaling | 95,000 tok/s | 9.90% |
 | **Colab `T4`** (16 GB, 65 TF) | Proxy `train.py` (11.5M) | Single-GPU `float16` + dynamic loss scaling | 101,000 tok/s | 8.85% |
 
 ```bash
-# Multi-session 1B pretraining on Kaggle TPU v5e-8 (stable phase on mix-1b, syncs to private HF Hub repo):
-# Add `--matmul-quant int8` (or `int8-all`) & `--param-dtype bfloat16` for ~175K+ tok/s on v5e-8!
-python -m scale.pretrain --preset 1b --dataset mix-1b \
+# Multi-session 1B pretraining on Kaggle TPU v5e-8 (stable phase on mix-1b, ~190K tok/s -> ~28h for 20B tokens!):
+# Use `--preset 1b` (1.036B dense) OR `--preset 1b-ve` (1.37B total / 1.036B active autoresearch winner, -0.097 BPB!)
+python -m scale.pretrain --preset 1b-ve --dataset mix-1b \
     --remat-policy save_all_compute --splash-block-size 1024 \
+    --param-dtype bfloat16 --opt-dtype bfloat16 --matmul-quant int8-all --muon-vmap \
+    --matrix-lr 0.04 --embedding-lr 0.4 --weight-decay 0.05 \
     --sync-backend hf --remote-target <your-user>/my-1b-base \
     --phase stable --max-hours 8.5
 
-# Trigger final WSD cooldown decay on high-density mix-cooldown once ready (~16-18B tokens):
-python -m scale.pretrain --preset 1b --dataset mix-cooldown \
+# Trigger final WSD cooldown decay in pure BF16 on high-density mix-cooldown (~16-18B tokens, same checkpoint!):
+python -m scale.pretrain --preset 1b-ve --dataset mix-cooldown \
     --remat-policy save_all_compute --splash-block-size 1024 \
+    --param-dtype bfloat16 --opt-dtype bfloat16 --matmul-quant none --muon-vmap \
+    --matrix-lr 0.04 --embedding-lr 0.4 --weight-decay 0.05 \
     --sync-backend hf --remote-target <your-user>/my-1b-base \
     --phase decay --decay-steps 4000 --max-hours 8.5
 ```
 
 ## Running the Test Suite
 
-Run both the proxy autoresearch suite (20 tests) and the 8-device FSDP 1B pretraining, multi-dataset mixer, BF16+SR, INT8/FP8 quantization & Fused Cut-Cross-Entropy suite (15 tests):
+Run both the proxy autoresearch suite (20 tests) and the 8-device FSDP 1B pretraining, multi-dataset mixer, BF16+SR, pre-quantized INT8/FP8, 8-device SplashAttention `shard_map`, & Fused Cut-Cross-Entropy suite (17 tests):
 
 ```bash
 pytest -v tests/
