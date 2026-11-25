@@ -454,6 +454,8 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
         prefetch=3,
     )
 
+    active_cursor = loader.cursor
+
     def make_trainer_state() -> dict:
         return {
             "step": step,
@@ -461,7 +463,7 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
             "best_val_bpb": best_val_bpb if math.isfinite(best_val_bpb) else None,
             "wsd_phase": tcfg.wsd_phase,
             "decay_start_step": tcfg.decay_start_step,
-            "data_cursor": loader.cursor.to_dict(),
+            "data_cursor": active_cursor.to_dict(),
             "model_spec": spec.to_dict(),
             "train_config": tcfg.to_dict(),
         }
@@ -477,7 +479,7 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
     window_steps = 0
 
     try:
-        x_np, y_np, cur = next(loader)
+        x_np, y_np, next_cur = next(loader)
         x_dev = jax.device_put(x_np, step_sharding)
         y_dev = jax.device_put(y_np, step_sharding)
         while not stop_requested["flag"]:
@@ -499,6 +501,8 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
             muon_mom = compute_muon_momentum(step)
             muon_wd = compute_weight_decay(step, tcfg)
 
+            cur = next_cur
+            active_cursor = cur
             params, opt_state, ce_arr, z_arr, gnorm_arr, finite_arr = train_step(
                 params,
                 opt_state,
@@ -509,11 +513,6 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
                 jax.device_put(jnp.float32(muon_wd), replicated),
                 jax.device_put(jnp.float32(loss_scale), replicated),
             )
-
-            # Overlap next host batch fetch + async H2D DMA with current TPU/GPU compute!
-            x_np, y_np, cur = next(loader)
-            x_dev = jax.device_put(x_np, step_sharding)
-            y_dev = jax.device_put(y_np, step_sharding)
 
             step += 1
             session_steps += 1
@@ -529,7 +528,14 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
                 (tcfg.max_steps is not None and session_steps >= tcfg.max_steps)
                 or tokens_seen >= tcfg.total_tokens
                 or (tcfg.wsd_phase == "decay" and tcfg.decay_start_step is not None and step >= tcfg.decay_start_step + tcfg.decay_steps)
+                or (tcfg.max_hours is not None and (time.time() - t_session_start) / 3600.0 >= tcfg.max_hours)
             )
+
+            # Overlap next host batch fetch + async H2D DMA with current TPU/GPU compute (skip on final step!)
+            if not is_last_step and not stop_requested["flag"]:
+                x_np, y_np, next_cur = next(loader)
+                x_dev = jax.device_put(x_np, step_sharding)
+                y_dev = jax.device_put(y_np, step_sharding)
 
             if should_log or use_loss_scale or should_eval or should_save or is_last_step:
                 ce_f = float(jax.block_until_ready(ce_arr))

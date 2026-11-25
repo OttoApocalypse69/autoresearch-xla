@@ -637,6 +637,8 @@ class _SingleSourceStream:
                 texts = pf.read_row_group(rg_idx, columns=[self.text_col]).column(self.text_col).to_pylist()
                 self.state = {"shard_idx": shard_idx, "row_group_idx": rg_idx, "epoch": epoch}
                 for i in range(0, len(texts), doc_batch_size):
+                    if self.stop_event.is_set():
+                        return
                     yield texts[i : i + doc_batch_size]
 
             start_rg = 0
@@ -777,23 +779,32 @@ class StreamingDataLoader:
             doc_buffer: list[list[int]] = []
             latest_cursor = DataCursor.from_dict(self._cursor.to_dict())
 
-            def refill():
+            def refill() -> bool:
                 nonlocal latest_cursor
-                batch_texts, latest_cursor = next(stream)
+                if self._stop.is_set():
+                    return False
+                try:
+                    batch_texts, latest_cursor = next(stream)
+                except StopIteration:
+                    return False
                 clean = [t for t in batch_texts if t]
                 if clean:
                     doc_buffer.extend(self.tokenizer.encode(clean, prepend=bos_id))
+                return True
 
             while not self._stop.is_set():
                 xs = np.empty((self.grad_accum_steps, self.batch_size, self.seq_len), dtype=np.int32)
                 ys = np.empty((self.grad_accum_steps, self.batch_size, self.seq_len), dtype=np.int32)
                 for k in range(self.grad_accum_steps):
+                    if self._stop.is_set():
+                        return
                     row_buf = np.empty((self.batch_size, row_cap), dtype=np.int32)
                     for r in range(self.batch_size):
                         pos = 0
                         while pos < row_cap:
                             while len(doc_buffer) < self.buffer_size:
-                                refill()
+                                if not refill():
+                                    return
                             rem = row_cap - pos
                             best_i, best_l = -1, 0
                             for idx_d, d in enumerate(doc_buffer):
@@ -815,12 +826,16 @@ class StreamingDataLoader:
                 item = (xs, ys, DataCursor.from_dict(latest_cursor.to_dict()))
                 while not self._stop.is_set():
                     try:
-                        self._queue.put(item, timeout=0.5)
+                        self._queue.put(item, timeout=0.1)
                         break
                     except queue.Full:
                         continue
         except BaseException as exc:
-            self._queue.put(exc)
+            if not self._stop.is_set():
+                try:
+                    self._queue.put(exc, timeout=0.5)
+                except queue.Full:
+                    pass
 
     def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray, DataCursor]]:
         return self
@@ -838,6 +853,13 @@ class StreamingDataLoader:
 
     def close(self) -> None:
         self._stop.set()
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        if self._worker.is_alive() and threading.current_thread() is not self._worker:
+            self._worker.join(timeout=5.0)
 
 
 # ---------------------------------------------------------------------------
