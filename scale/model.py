@@ -30,10 +30,7 @@ from jax.sharding import Mesh
 from scale.attention import fused_causal_attention, resolve_attn_backend
 from scale.config import ModelSpec
 from scale.quant import (
-    _apply_chip_scale,
     _dw_from_saved_xt_int8,
-    _dw_from_shared_int8,
-    _quantize_tensor_local,
     _quantize_x_for_dw_int8,
     qdot,
     quantize_int8,
@@ -571,17 +568,10 @@ def _make_fused_chunked_loss_fn(softcap: float, z_loss_weight: float):
     return _fused_loss
 
 
-def _make_fused_chunked_loss_int8_bwd_fn(
-    softcap: float,
-    z_loss_weight: float,
-    mesh: Optional[Mesh],
-    fast_shared: bool = False,
-):
+def _make_fused_chunked_loss_int8_bwd_fn(softcap: float, z_loss_weight: float, mesh: Optional[Mesh]):
     """
     Single-pass Cut-Cross-Entropy with 100% exact BF16->FP32 forward logits + softmax,
     and 394-TOPS INT8 MXU backward (`d_x` & `d_lm_w`) using pre-quantized `lm_w_qb`.
-    When `fast_shared=True` (`int8-fast`), quantizes `d_raw` and `xc` ONCE via scalar
-    per-chip scaling and reuses `dr_q` for BOTH `d_x` and `d_lm_w` (zero axis-0 reductions!).
     """
     @jax.custom_vjp
     def _fused_loss(x_ch, lm_w, lm_w_qb, lm_w_sb, y_ch, scale):
@@ -635,22 +625,14 @@ def _make_fused_chunked_loss_int8_bwd_fn(
             d_logits = d_logits - jax.nn.one_hot(yc, vocab_size, dtype=jnp.float32)
             d_raw = d_logits * (jnp.float32(1.0) - th * th) if th is not None else d_logits
 
-            if fast_shared:
-                # Quantize d_raw ONCE & xc ONCE — reuse dr_q for BOTH d_x and d_w!
-                dr_q, dr_s = _quantize_tensor_local(d_raw, mesh)
-                dx_i32 = jnp.dot(dr_q, lm_w_qb.T, preferred_element_type=jnp.int32)
-                dx_c = (_apply_chip_scale(dx_i32.astype(jnp.float32), dr_s, mesh) * lm_w_sb.T * tok_scale).astype(xc.dtype)
-                xq, xs = _quantize_tensor_local(xc, mesh)
-                dw_unnorm = _dw_from_shared_int8(xq, xs, dr_q, dr_s, dw_acc_dtype, mesh)
-            else:
-                # 394-TOPS INT8 backward d_x = d_raw @ lm_w.T (1-byte pre-quantized lm_w_qb!)
-                dr_q, dr_s = quantize_int8(d_raw, axis=-1)
-                dx_i32 = jnp.dot(dr_q, lm_w_qb.T, preferred_element_type=jnp.int32)
-                dx_c = (dx_i32.astype(jnp.float32) * (dr_s * lm_w_sb.T) * tok_scale).astype(xc.dtype)
+            # 394-TOPS INT8 backward d_x = d_raw @ lm_w.T (1-byte pre-quantized lm_w_qb!)
+            dr_q, dr_s = quantize_int8(d_raw, axis=-1)
+            dx_i32 = jnp.dot(dr_q, lm_w_qb.T, preferred_element_type=jnp.int32)
+            dx_c = (dx_i32.astype(jnp.float32) * (dr_s * lm_w_sb.T) * tok_scale).astype(xc.dtype)
 
-                # 394-TOPS INT8 backward d_w = x.T @ d_raw (FSDP-local bf16 psum_scatter on v5e-8!)
-                xt_q, xt_s = _quantize_x_for_dw_int8(xc, mesh)
-                dw_unnorm = _dw_from_saved_xt_int8(xt_q, xt_s, d_raw, dw_acc_dtype, mesh)
+            # 394-TOPS INT8 backward d_w = x.T @ d_raw (FSDP-local bf16 psum_scatter on v5e-8!)
+            xt_q, xt_s = _quantize_x_for_dw_int8(xc, mesh)
+            dw_unnorm = _dw_from_saved_xt_int8(xt_q, xt_s, d_raw, dw_acc_dtype, mesh)
 
             dw_acc = dw_acc + (dw_unnorm.astype(jnp.float32) * tok_scale).astype(dw_acc_dtype)
             return (tot_acc + tot_c, ce_acc + ce_c, z_acc + z_c, dw_acc), dx_c
@@ -721,11 +703,9 @@ def forward_scalar_loss_and_z(
     packed = _pack_fsdp_chunks(x, targets, spec.loss_chunk_size, mesh)
     if packed is not None:
         x_chunks, y_chunks, _, _ = packed
-        if spec.matmul_quant in ("int8-all", "int8-fast") and q_cache is not None and "lm_head_bwd" in q_cache:
+        if spec.matmul_quant == "int8-all" and q_cache is not None and "lm_head_bwd" in q_cache:
             lm_w_qb, lm_w_sb = q_cache["lm_head_bwd"]
-            fused_q_fn = _make_fused_chunked_loss_int8_bwd_fn(
-                spec.softcap, spec.z_loss_weight, mesh, fast_shared=(spec.matmul_quant == "int8-fast")
-            )
+            fused_q_fn = _make_fused_chunked_loss_int8_bwd_fn(spec.softcap, spec.z_loss_weight, mesh)
             return fused_q_fn(x_chunks, lm_w, lm_w_qb, lm_w_sb, y_chunks, scale)
         fused_fn = _make_fused_chunked_loss_fn(spec.softcap, spec.z_loss_weight)
         return fused_fn(x_chunks, lm_w, y_chunks, scale)

@@ -562,3 +562,117 @@ for qmode in ("int8", "int8-all", "fp8"):
     )
     assert res.returncode == 0, f"8-dev prequant FSDP test failed:\n{res.stdout}\n{res.stderr}"
 
+
+def test_round2_unet_ve_stride_single_chunk_fsdp():
+    """Verify Round-2 champion preset (1b-ve) and 8-device FSDP training with U-Net skips, ve_stride=2, SSSL, and single-chunk INT8 loss."""
+    spec_1b_ve = get_model_preset("1b-ve")
+    assert spec_1b_ve.use_value_embeds is True
+    assert spec_1b_ve.use_unet_skip is True
+    assert spec_1b_ve.window_pattern == "SSSL"
+    assert spec_1b_ve.rope_base == 50000.0
+    assert spec_1b_ve.z_loss_weight == 5e-4
+
+    code = """
+import numpy as np
+import jax, jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
+from scale.config import TrainConfig, get_model_preset
+from scale.fsdp import build_tree_shardings, create_fsdp_mesh, shard_pytree
+from scale.model import count_params, forward_scalar_loss_and_z, init_params, precompute_rotary_embeddings
+from scale.optimizer import init_opt_state, optimizer_step
+from scale.quant import prequantize_model_weights
+
+mesh = create_fsdp_mesh()
+assert mesh.size == 8
+
+# Test both ve_stride=1 and ve_stride=2 with U-Net skips + SSSL + single-chunk loss (local_tok == loss_chunk_size == 256)
+spec_full = get_model_preset(
+    "smoke",
+    arch_overrides={
+        "n_layer": 8,
+        "window_pattern": "SSSL",
+        "use_value_embeds": True,
+        "ve_stride": 1,
+        "use_unet_skip": True,
+        "rope_base": 50000.0,
+        "z_loss_weight": 5e-4,
+        "loss_chunk_size": 256,
+        "matmul_quant": "int8-all",
+        "remat_policy": "save_all_compute",
+    },
+)
+spec_half = get_model_preset(
+    "smoke",
+    arch_overrides={
+        "n_layer": 8,
+        "window_pattern": "SSSL",
+        "use_value_embeds": True,
+        "ve_stride": 2,
+        "use_unet_skip": True,
+        "rope_base": 50000.0,
+        "z_loss_weight": 5e-4,
+        "loss_chunk_size": 256,
+        "matmul_quant": "int8-all",
+        "remat_policy": "save_all_compute",
+    },
+)
+p_full = init_params(jax.random.PRNGKey(0), spec_full, param_dtype=jnp.bfloat16)
+p_half = init_params(jax.random.PRNGKey(0), spec_half, param_dtype=jnp.bfloat16)
+assert p_full["value_embeds"].shape[0] == 8
+assert p_half["value_embeds"].shape[0] == 4
+assert count_params(p_half)["total"] < count_params(p_full)["total"]
+assert "unet_lambdas" in p_half and p_half["unet_lambdas"].shape == (4,)
+
+tcfg = TrainConfig(
+    total_batch_size=2048,
+    per_device_batch=1,
+    param_dtype="bfloat16",
+    opt_dtype="bfloat16",
+    matrix_lr=0.06,
+    embedding_lr=0.5,
+    weight_decay=0.03,
+    muon_vmap=True,
+)
+p_sh = build_tree_shardings(p_half, mesh, use_fsdp=True)
+params = shard_pytree(p_half, p_sh)
+opt_state = init_opt_state(params, opt_dtype=jnp.bfloat16)
+o_sh = build_tree_shardings(opt_state, mesh, use_fsdp=True)
+opt_state = shard_pytree(opt_state, o_sh)
+
+cos, sin = precompute_rotary_embeddings(spec_half.sequence_len, spec_half.head_dim, base=spec_half.rope_base)
+batch_sh = NamedSharding(mesh, P("fsdp", None))
+x = jax.device_put(jax.random.randint(jax.random.PRNGKey(7), (8, spec_half.sequence_len), 0, spec_half.vocab_size), batch_sh)
+y = jax.device_put(jax.random.randint(jax.random.PRNGKey(8), (8, spec_half.sequence_len), 0, spec_half.vocab_size), batch_sh)
+
+@jax.jit
+def step_fn(p, st):
+    q_cache = prequantize_model_weights(p, spec_half.matmul_quant, spec_half.tie_embeddings)
+    def loss_fn(p_in):
+        tot, ce, _ = forward_scalar_loss_and_z(
+            p_in, x, y, cos, sin, spec_half, jnp.bfloat16, scale=jnp.float32(1.0), mesh=mesh, q_cache=q_cache
+        )
+        return tot, ce
+    (_, ce), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
+    p_next, st_next, gnorm = optimizer_step(
+        p, grads, st, jnp.float32(1.0), jnp.float32(0.9), jnp.float32(0.03), spec_half, tcfg, jnp.bfloat16
+    )
+    return p_next, st_next, ce, gnorm
+
+losses = []
+for _ in range(3):
+    params, opt_state, ce, gnorm = step_fn(params, opt_state)
+    assert np.isfinite(float(ce)) and np.isfinite(float(gnorm))
+    losses.append(float(ce))
+assert losses[-1] < losses[0], f"Round-2 U-Net + ve_stride=2 loss did not decrease: {losses}"
+print(f"Round-2 8-dev FSDP OK: losses={losses}")
+"""
+    res = subprocess.run(
+        [PYTHON, "-c", code],
+        cwd=str(REPO_ROOT),
+        env={**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=8"},
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, f"Round-2 8-dev FSDP test failed:\n{res.stdout}\n{res.stderr}"
+
+

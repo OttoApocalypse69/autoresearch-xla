@@ -41,7 +41,7 @@ class ModelSpec:
     attn_impl: str = "auto"          # "auto" (Splash on TPU, cuDNN on Ampere+ GPU, XLA fallback) | "splash" | "cudnn" | "xla"
     loss_chunk_size: int = 2048      # Chunked linear CE token count (0 disables; 2048 cuts logits HBM by ~8-16x!)
     splash_block_size: int = 1024    # TPU Pallas SplashAttention VMEM tile size (auto-clamped to seq_len)
-    matmul_quant: str = "none"       # Experimental linear GEMM quant: "none" | "int8" | "int8-all" | "int8-fast" | "fp8"
+    matmul_quant: str = "none"       # Experimental linear GEMM quant: "none" | "int8" | "int8-all" | "fp8"
     scan_unroll: int = 1             # jax.lax.scan layer unroll factor (1 or 2 for pipeline overlap)
 
     def __post_init__(self) -> None:
@@ -52,7 +52,7 @@ class ModelSpec:
         valid_remat = ("none", "save_all_compute", "save_attn", "save_qkv_attn", "dots_with_no_batch_dims", "dots", "full")
         assert self.remat_policy in valid_remat, f"Invalid remat_policy: {self.remat_policy!r}"
         assert self.attn_impl in ("auto", "splash", "cudnn", "xla"), f"Invalid attn_impl: {self.attn_impl!r}"
-        assert self.matmul_quant in ("none", "int8", "int8-all", "int8-fast", "fp8"), f"Invalid matmul_quant: {self.matmul_quant!r}"
+        assert self.matmul_quant in ("none", "int8", "int8-all", "fp8"), f"Invalid matmul_quant: {self.matmul_quant!r}"
         assert self.scan_unroll >= 1, f"scan_unroll must be >= 1, got {self.scan_unroll}"
         assert self.ve_stride >= 1, f"ve_stride must be >= 1, got {self.ve_stride}"
 
@@ -161,8 +161,9 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         remat_policy="save_attn",
         loss_chunk_size=2048,
     ),
-    # ~1.37B total / 1.036B active-FLOPs autoresearch winner (ResFormer Value Embeddings + SSSL window: -0.0967 BPB on mix-1b!)
-    # Recommended optimizer flags from proxy sweep: --matrix-lr 0.04 --embedding-lr 0.4 --weight-decay 0.05
+    # ~1.37B total / 1.036B active-FLOPs Round-2 autoresearch champion (-0.11 BPB on mix-1b + 8.5% faster U-Net scan!):
+    # ResFormer Value Embeddings + SSSL window + U-Net skips + RoPE 50k + z_loss 5e-4.
+    # Recommended optimizer flags: --matrix-lr 0.06 --embedding-lr 0.5 --weight-decay 0.03
     "1b-ve": ModelSpec(
         sequence_len=2048,
         vocab_size=32768,
@@ -174,6 +175,9 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         activation="swiglu",
         window_pattern="SSSL",
         use_value_embeds=True,
+        use_unet_skip=True,
+        rope_base=50000.0,
+        z_loss_weight=5e-4,
         remat_policy="save_all_compute",
         loss_chunk_size=2048,
     ),
