@@ -141,18 +141,23 @@ def _build_train_step(
         out_shardings=(param_shardings, opt_shardings, replicated, replicated, replicated, replicated),
     )
     def train_step(p, st, x_steps, y_steps, lrm, muon_mom, muon_wd, loss_scale):
+        # Megatron/MaxText mixed precision: cast fp32 master weights to bf16 ONCE before
+        # micro-step accumulation -> halves weight HBM reads AND halves micro-grad buffers!
+        use_bf16_w = compute_dtype == jnp.bfloat16
+        p_work = jax.tree_util.tree_map(lambda a: a.astype(jnp.bfloat16), p) if use_bf16_w else p
+        acc_dtype = jnp.bfloat16 if (tcfg.opt_dtype == "bfloat16" and use_bf16_w) else jnp.float32
+
         if grad_accum_steps == 1:
-            # Fast path: skip lax.scan + zero_grads allocation entirely when batch fits in 1 microstep!
-            (_, (mean_ce, mean_z)), g_raw = grad_fn(p, x_steps[0], y_steps[0], loss_scale)
+            (_, (mean_ce, mean_z)), g_raw = grad_fn(p_work, x_steps[0], y_steps[0], loss_scale)
             grads = jax.tree_util.tree_map(lambda g: g / loss_scale, g_raw) if use_loss_scale else g_raw
         else:
-            zero_grads = jax.tree_util.tree_map(jnp.zeros_like, p)
+            zero_grads = jax.tree_util.tree_map(lambda a: jnp.zeros_like(a, dtype=acc_dtype), p)
 
             def accum_body(carry, batch):
                 g_acc, ce_acc, z_acc = carry
                 xb, yb = batch
-                (_, (ce_val, z_val)), g_micro = grad_fn(p, xb, yb, loss_scale)
-                g_acc = jax.tree_util.tree_map(lambda a, b: a + b, g_acc, g_micro)
+                (_, (ce_val, z_val)), g_micro = grad_fn(p_work, xb, yb, loss_scale)
+                g_acc = jax.tree_util.tree_map(lambda a, b: a + b.astype(acc_dtype), g_acc, g_micro)
                 return (g_acc, ce_acc + ce_val, z_acc + z_val), None
 
             (g_sum, ce_sum, z_sum), _ = jax.lax.scan(
@@ -161,7 +166,8 @@ def _build_train_step(
                 (x_steps, y_steps),
             )
             inv_accum = jnp.float32(1.0 / grad_accum_steps)
-            grads = jax.tree_util.tree_map(lambda g: g * (inv_accum / loss_scale), g_sum)
+            inv_scale = inv_accum / loss_scale
+            grads = jax.tree_util.tree_map(lambda g: (g.astype(jnp.float32) * inv_scale).astype(acc_dtype), g_sum)
             mean_ce = ce_sum * inv_accum
             mean_z = z_sum * inv_accum
 
@@ -681,7 +687,11 @@ def main() -> None:
     )
     parser.add_argument("--preset", choices=list(MODEL_PRESETS.keys()), default="1b", help="Model scale preset")
     parser.add_argument("--arch-config", type=str, default=None, help="Optional JSON overrides from autoresearch winner")
-    parser.add_argument("--remat-policy", choices=["none", "dots_with_no_batch_dims", "dots", "full"], default=None)
+    parser.add_argument(
+        "--remat-policy",
+        choices=["none", "save_all_compute", "save_attn", "save_qkv_attn", "dots_with_no_batch_dims", "dots", "full"],
+        default=None,
+    )
     parser.add_argument("--attn-impl", choices=["auto", "splash", "cudnn", "xla"], default=None)
     parser.add_argument("--loss-chunk-size", type=int, default=None, help="Chunked CE token count (0=off, 2048=default)")
     parser.add_argument("--splash-block-size", type=int, default=None, help="TPU SplashAttention tile size (128/256/512)")

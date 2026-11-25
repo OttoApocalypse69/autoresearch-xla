@@ -23,10 +23,11 @@ import functools
 from typing import Optional
 
 import jax
+from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
-from scale.attention import fused_causal_attention
+from scale.attention import fused_causal_attention, resolve_attn_backend
 from scale.config import ModelSpec
 
 
@@ -103,11 +104,89 @@ def init_params(key: jax.Array, spec: ModelSpec) -> dict:
 def _get_checkpoint_policy(remat_policy: str):
     if remat_policy == "none":
         return None
+    if remat_policy == "save_all_compute":
+        return jax.checkpoint_policies.dots_with_no_batch_dims_saveable
+    if remat_policy == "save_attn":
+        return jax.checkpoint_policies.save_only_these_names("qkv", "context")
+    if remat_policy == "save_qkv_attn":
+        return jax.checkpoint_policies.save_only_these_names("qkv", "context")
     if remat_policy == "dots_with_no_batch_dims":
         return jax.checkpoint_policies.dots_with_no_batch_dims_saveable
     if remat_policy == "dots":
         return jax.checkpoint_policies.dots_saveable
     return jax.checkpoint_policies.nothing_saveable
+
+
+def _pre_attn_subblock(
+    blk: dict,
+    resid_lam: jax.Array,
+    x0_lam: jax.Array,
+    x: jax.Array,
+    x0: jax.Array,
+    ve_tok: Optional[jax.Array],
+    cos: jax.Array,
+    sin: jax.Array,
+    spec: ModelSpec,
+    compute_dtype,
+):
+    B, T, C = x.shape
+    head_dim = spec.head_dim
+    kv_dim = spec.kv_dim
+    ve_ch = min(32, C)
+
+    if spec.use_resid_lambdas:
+        x = resid_lam.astype(compute_dtype) * x + x0_lam.astype(compute_dtype) * x0
+
+    h = rms_norm(x)
+    qkv = jnp.dot(h.reshape(B * T, C), blk["w_qkv"].astype(compute_dtype))
+    qkv = checkpoint_name(qkv, "qkv")
+    q = qkv[:, :C].reshape(B, T, spec.n_head, head_dim)
+    k = qkv[:, C : C + kv_dim].reshape(B, T, spec.n_kv_head, head_dim)
+    v = qkv[:, C + kv_dim :].reshape(B, T, spec.n_kv_head, head_dim)
+
+    if ve_tok is not None and "ve_gate" in blk:
+        ve_h = ve_tok.astype(compute_dtype).reshape(B, T, spec.n_kv_head, head_dim)
+        gate = 2.0 * jax.nn.sigmoid(jnp.dot(h[..., :ve_ch], blk["ve_gate"].astype(compute_dtype)))
+        v = v + gate[..., None] * ve_h
+
+    q = apply_rotary_emb(q, cos, sin)
+    k = apply_rotary_emb(k, cos, sin)
+    if spec.use_qk_norm:
+        q = rms_norm(q)
+        k = rms_norm(k)
+    return q, k, v
+
+
+def _post_attn_mlp_subblock(
+    blk: dict,
+    resid_lam: jax.Array,
+    x0_lam: jax.Array,
+    x: jax.Array,
+    x0: jax.Array,
+    y: jax.Array,
+    spec: ModelSpec,
+    compute_dtype,
+) -> jax.Array:
+    B, T, C = x.shape
+    if spec.use_resid_lambdas:
+        x = resid_lam.astype(compute_dtype) * x + x0_lam.astype(compute_dtype) * x0
+
+    y_out = jnp.dot(y.reshape(B * T, C), blk["c_proj"].astype(compute_dtype)).reshape(B, T, C)
+    y_out = checkpoint_name(y_out, "out_proj")
+    x = x + y_out
+
+    m = rms_norm(x).reshape(B * T, C)
+    if spec.activation == "swiglu":
+        gu = jnp.dot(m, blk["w_gate_up"].astype(compute_dtype))
+        gate, up = jnp.split(gu, 2, axis=-1)
+        m = jax.nn.silu(gate) * up
+    elif spec.activation == "relu2":
+        m = jnp.square(jax.nn.relu(jnp.dot(m, blk["mlp_fc"].astype(compute_dtype))))
+    else:  # "gelu"
+        m = jax.nn.gelu(jnp.dot(m, blk["mlp_fc"].astype(compute_dtype)), approximate=True)
+
+    mlp_out = jnp.dot(m, blk["mlp_down"].astype(compute_dtype)).reshape(B, T, C)
+    return x + mlp_out
 
 
 def _apply_single_layer(
@@ -124,32 +203,7 @@ def _apply_single_layer(
     compute_dtype,
     mesh: Optional[Mesh],
 ) -> jax.Array:
-    B, T, C = x.shape
-    head_dim = spec.head_dim
-    kv_dim = spec.kv_dim
-    ve_ch = min(32, C)
-
-    if spec.use_resid_lambdas:
-        x = resid_lam.astype(compute_dtype) * x + x0_lam.astype(compute_dtype) * x0
-
-    # --- Attention sub-block (Fused QKV projection) ---
-    h = rms_norm(x)
-    qkv = jnp.dot(h.reshape(B * T, C), blk["w_qkv"].astype(compute_dtype))
-    q = qkv[:, :C].reshape(B, T, spec.n_head, head_dim)
-    k = qkv[:, C : C + kv_dim].reshape(B, T, spec.n_kv_head, head_dim)
-    v = qkv[:, C + kv_dim :].reshape(B, T, spec.n_kv_head, head_dim)
-
-    if ve_tok is not None and "ve_gate" in blk:
-        ve_h = ve_tok.astype(compute_dtype).reshape(B, T, spec.n_kv_head, head_dim)
-        gate = 2.0 * jax.nn.sigmoid(jnp.dot(h[..., :ve_ch], blk["ve_gate"].astype(compute_dtype)))
-        v = v + gate[..., None] * ve_h
-
-    q = apply_rotary_emb(q, cos, sin)
-    k = apply_rotary_emb(k, cos, sin)
-    if spec.use_qk_norm:
-        q = rms_norm(q)
-        k = rms_norm(k)
-
+    q, k, v = _pre_attn_subblock(blk, resid_lam, x0_lam, x, x0, ve_tok, cos, sin, spec, compute_dtype)
     y = fused_causal_attention(
         q,
         k,
@@ -159,23 +213,8 @@ def _apply_single_layer(
         splash_block_size=spec.splash_block_size,
         mesh=mesh,
     )
-    y_out = jnp.dot(y.reshape(B * T, C), blk["c_proj"].astype(compute_dtype)).reshape(B, T, C)
-    x = x + y_out
-
-    # --- MLP sub-block (Fused Gate+Up for SwiGLU) ---
-    m = rms_norm(x).reshape(B * T, C)
-    if spec.activation == "swiglu":
-        gu = jnp.dot(m, blk["w_gate_up"].astype(compute_dtype))
-        gate, up = jnp.split(gu, 2, axis=-1)
-        m = jax.nn.silu(gate) * up
-    elif spec.activation == "relu2":
-        m = jnp.square(jax.nn.relu(jnp.dot(m, blk["mlp_fc"].astype(compute_dtype))))
-    else:  # "gelu"
-        m = jax.nn.gelu(jnp.dot(m, blk["mlp_fc"].astype(compute_dtype)), approximate=True)
-
-    mlp_out = jnp.dot(m, blk["mlp_down"].astype(compute_dtype)).reshape(B, T, C)
-    x = x + mlp_out
-    return x
+    y = checkpoint_name(y, "context")
+    return _post_attn_mlp_subblock(blk, resid_lam, x0_lam, x, x0, y, spec, compute_dtype)
 
 
 def _make_layer_fn(
@@ -184,6 +223,42 @@ def _make_layer_fn(
     compute_dtype,
     mesh: Optional[Mesh],
 ):
+    policy_name = "none" if (not spec.use_remat and spec.remat_policy == "full") else spec.remat_policy
+    attn_backend = resolve_attn_backend(spec.attn_impl)
+
+    # For O(T)-memory fused kernels (TPU SplashAttention & GPU cuDNN FlashAttention),
+    # split-remat keeps attention outside jax.checkpoint so attention forward NEVER runs twice,
+    # while checkpointing pre-attn & post-attn/MLP discards giant silu & fp32 rms_norm buffers!
+    if policy_name in ("save_all_compute", "save_attn") and attn_backend in ("splash", "cudnn"):
+        pre_fn = jax.checkpoint(
+            functools.partial(_pre_attn_subblock, spec=spec, compute_dtype=compute_dtype),
+            policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+        )
+        post_pol = (
+            jax.checkpoint_policies.dots_with_no_batch_dims_saveable
+            if policy_name == "save_all_compute"
+            else jax.checkpoint_policies.nothing_saveable
+        )
+        post_fn = jax.checkpoint(
+            functools.partial(_post_attn_mlp_subblock, spec=spec, compute_dtype=compute_dtype),
+            policy=post_pol,
+        )
+
+        def split_layer(blk, resid_lam, x0_lam, x, x0, ve_tok, cos, sin):
+            q, k, v = pre_fn(blk, resid_lam, x0_lam, x, x0, ve_tok, cos, sin)
+            y = fused_causal_attention(
+                q,
+                k,
+                v,
+                window_size=window_size,
+                backend=spec.attn_impl,
+                splash_block_size=spec.splash_block_size,
+                mesh=mesh,
+            )
+            return post_fn(blk, resid_lam, x0_lam, x, x0, y)
+
+        return split_layer
+
     fn = functools.partial(
         _apply_single_layer,
         spec=spec,
@@ -191,7 +266,6 @@ def _make_layer_fn(
         compute_dtype=compute_dtype,
         mesh=mesh,
     )
-    policy_name = "none" if (not spec.use_remat and spec.remat_policy == "full") else spec.remat_policy
     policy = _get_checkpoint_policy(policy_name)
     if policy is None:
         return fn
@@ -301,7 +375,7 @@ def forward_logits(
     """Compute full float32 (optionally softcapped) logits of shape (B, T, vocab_size)."""
     x = forward_hidden(params, idx, cos, sin, spec, compute_dtype, mesh=mesh)
     lm_w = params["wte"].T.astype(compute_dtype) if spec.tie_embeddings else params["lm_head"].astype(compute_dtype)
-    logits = jnp.dot(x, lm_w).astype(jnp.float32)
+    logits = jnp.dot(x, lm_w, preferred_element_type=jnp.float32)
     if spec.softcap > 0.0:
         logits = spec.softcap * jnp.tanh(logits / spec.softcap)
     return logits
@@ -309,7 +383,7 @@ def forward_logits(
 
 def _chunk_ce_and_z(x_chunk: jax.Array, y_chunk: jax.Array, lm_w: jax.Array, softcap: float):
     """Compute exact float32 NLL and mean z-loss for a chunk of `(K, C)` hidden states."""
-    logits = jnp.dot(x_chunk, lm_w).astype(jnp.float32)
+    logits = jnp.dot(x_chunk, lm_w, preferred_element_type=jnp.float32)
     if softcap > 0.0:
         logits = softcap * jnp.tanh(logits / softcap)
     log_z = jax.scipy.special.logsumexp(logits, axis=-1)
