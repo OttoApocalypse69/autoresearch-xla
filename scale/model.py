@@ -30,7 +30,10 @@ from jax.sharding import Mesh
 from scale.attention import fused_causal_attention, resolve_attn_backend
 from scale.config import ModelSpec
 from scale.quant import (
+    _apply_chip_scale,
     _dw_from_saved_xt_int8,
+    _dw_from_shared_int8,
+    _quantize_tensor_local,
     _quantize_x_for_dw_int8,
     qdot,
     quantize_int8,
@@ -106,9 +109,12 @@ def init_params(key: jax.Array, spec: ModelSpec, param_dtype=jnp.float32) -> dic
             jax.random.normal(next_key(), (C, spec.vocab_size), dtype=jnp.float32) * 0.001
         ).astype(param_dtype)
     if spec.use_value_embeds:
+        n_ve = (L + spec.ve_stride - 1) // spec.ve_stride
         params["value_embeds"] = jax.random.uniform(
-            next_key(), (L, spec.vocab_size, kv_dim), jnp.float32, -s, s
+            next_key(), (n_ve, spec.vocab_size, kv_dim), jnp.float32, -s, s
         ).astype(param_dtype)
+    if spec.use_unet_skip:
+        params["unet_lambdas"] = jnp.zeros((L // 2,), dtype=jnp.float32)
     return params
 
 
@@ -316,6 +322,8 @@ def forward_hidden(
     q_blocks: Optional[dict] = None,
 ) -> jax.Array:
     """Run embedding + scanned transformer stack + final RMSNorm; returns `(B, T, C)` in compute_dtype."""
+    import math
+
     T = idx.shape[1]
     # Pre-cast RoPE tables ONCE outside the layer scan (saves 2*L redundant casts)
     cos_t = cos[:, :T].astype(compute_dtype)
@@ -326,37 +334,17 @@ def forward_hidden(
     x0 = x
 
     pattern = spec.window_pattern.upper()
+    ve_table = params.get("value_embeds", None)
+    ve_stride = spec.ve_stride if ve_table is not None else 1
+    if ve_stride > 1 and len(pattern) % ve_stride != 0:
+        rep = math.lcm(len(pattern), ve_stride) // len(pattern)
+        pattern = pattern * rep
     G = len(pattern)
     short_win = (max(1, spec.sequence_len // 2), 0)
-    ve_table = params.get("value_embeds", None)
     q_scan = q_blocks if q_blocks is not None else {}
+    unet_lams = params.get("unet_lambdas", None) if spec.use_unet_skip else None
 
-    if pattern == "L":
-        layer_fn = _make_layer_fn(spec, None, compute_dtype, mesh)
-        if ve_table is not None:
-            def scan_body_ve(carry_x, layer_inputs):
-                blk, qb, r_lam, x0_lam, ve_w = layer_inputs
-                return layer_fn(blk, qb or None, r_lam, x0_lam, carry_x, x0, ve_w[idx], cos_t, sin_t), None
-
-            x, _ = jax.lax.scan(
-                scan_body_ve,
-                x,
-                (params["blocks"], q_scan, params["resid_lambdas"], params["x0_lambdas"], ve_table),
-                unroll=spec.scan_unroll,
-            )
-        else:
-            def scan_body_nove(carry_x, layer_inputs):
-                blk, qb, r_lam, x0_lam = layer_inputs
-                return layer_fn(blk, qb or None, r_lam, x0_lam, carry_x, x0, None, cos_t, sin_t), None
-
-            x, _ = jax.lax.scan(
-                scan_body_nove,
-                x,
-                (params["blocks"], q_scan, params["resid_lambdas"], params["x0_lambdas"]),
-                unroll=spec.scan_unroll,
-            )
-
-    elif spec.n_layer % G == 0:
+    if spec.n_layer % G == 0:
         n_groups = spec.n_layer // G
         group_fns = [
             _make_layer_fn(spec, short_win if pattern[g] == "S" else None, compute_dtype, mesh)
@@ -370,44 +358,110 @@ def forward_hidden(
         grouped_q = jax.tree_util.tree_map(reshape_group, q_scan)
         grouped_r = reshape_group(params["resid_lambdas"])
         grouped_x0 = reshape_group(params["x0_lambdas"])
-        grouped_ve = reshape_group(ve_table) if ve_table is not None else None
-
-        if grouped_ve is not None:
-            def group_body_ve(carry_x, grp):
-                g_blk, g_qb, g_r, g_x0, g_ve = grp
-                cur = carry_x
-                for g in range(G):
-                    blk_g = jax.tree_util.tree_map(lambda a: a[g], g_blk)
-                    qb_g = jax.tree_util.tree_map(lambda a: a[g], g_qb) if g_qb else None
-                    cur = group_fns[g](blk_g, qb_g, g_r[g], g_x0[g], cur, x0, g_ve[g][idx], cos_t, sin_t)
-                return cur, None
-
-            x, _ = jax.lax.scan(
-                group_body_ve, x, (grouped_blocks, grouped_q, grouped_r, grouped_x0, grouped_ve), unroll=spec.scan_unroll
-            )
+        if ve_table is not None:
+            ve_per_grp = G // ve_stride
+            grouped_ve = ve_table.reshape((n_groups, ve_per_grp) + ve_table.shape[1:])
         else:
-            def group_body_nove(carry_x, grp):
-                g_blk, g_qb, g_r, g_x0 = grp
-                cur = carry_x
-                for g in range(G):
-                    blk_g = jax.tree_util.tree_map(lambda a: a[g], g_blk)
-                    qb_g = jax.tree_util.tree_map(lambda a: a[g], g_qb) if g_qb else None
-                    cur = group_fns[g](blk_g, qb_g, g_r[g], g_x0[g], cur, x0, None, cos_t, sin_t)
+            grouped_ve = None
+
+        def _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_skip_lams=None, g_skips=None):
+            cur = carry_x
+            outs = []
+            for g in range(G):
+                if g_skip_lams is not None and g_skips is not None:
+                    cur = cur + g_skip_lams[g].astype(compute_dtype) * g_skips[g]
+                blk_g = jax.tree_util.tree_map(lambda a: a[g], g_blk)
+                qb_g = jax.tree_util.tree_map(lambda a: a[g], g_qb) if g_qb else None
+                ve_tok = g_ve[g // ve_stride][idx] if (g_ve is not None and g % ve_stride == 0) else None
+                cur = group_fns[g](blk_g, qb_g, g_r[g], g_x0[g], cur, x0, ve_tok, cos_t, sin_t)
+                outs.append(cur)
+            return cur, outs
+
+        def _slice_grp(tree, start: int, end: int):
+            return jax.tree_util.tree_map(lambda a: a[start:end], tree)
+
+        if unet_lams is not None and n_groups >= 2:
+            enc_g = n_groups // 2
+            dec_start = n_groups - enc_g
+            n_skip = enc_g * G
+
+            def enc_body(carry_x, grp):
+                g_blk, g_qb, g_r, g_x0, g_ve = grp
+                cur, outs = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve)
+                return cur, jnp.stack(outs, axis=0)
+
+            enc_in = (
+                _slice_grp(grouped_blocks, 0, enc_g),
+                _slice_grp(grouped_q, 0, enc_g),
+                grouped_r[:enc_g],
+                grouped_x0[:enc_g],
+                grouped_ve[:enc_g] if grouped_ve is not None else None,
+            )
+            x, enc_skips = jax.lax.scan(enc_body, x, enc_in, unroll=spec.scan_unroll)
+            # Reverse encoder layer outputs so decoder layer (L-1-i) pairs with encoder layer i
+            flat_skips = enc_skips.reshape((n_skip,) + x.shape)
+            dec_skips = jnp.flip(flat_skips, axis=0).reshape((enc_g, G) + x.shape)
+            dec_lams = unet_lams[:n_skip].reshape((enc_g, G))
+
+            if dec_start > enc_g:
+                def mid_body(carry_x, grp):
+                    g_blk, g_qb, g_r, g_x0, g_ve = grp
+                    cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve)
+                    return cur, None
+
+                mid_in = (
+                    _slice_grp(grouped_blocks, enc_g, dec_start),
+                    _slice_grp(grouped_q, enc_g, dec_start),
+                    grouped_r[enc_g:dec_start],
+                    grouped_x0[enc_g:dec_start],
+                    grouped_ve[enc_g:dec_start] if grouped_ve is not None else None,
+                )
+                x, _ = jax.lax.scan(mid_body, x, mid_in, unroll=spec.scan_unroll)
+
+            def dec_body(carry_x, grp):
+                g_blk, g_qb, g_r, g_x0, g_ve, g_ul, g_sk = grp
+                cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_ul, g_sk)
+                return cur, None
+
+            dec_in = (
+                _slice_grp(grouped_blocks, dec_start, n_groups),
+                _slice_grp(grouped_q, dec_start, n_groups),
+                grouped_r[dec_start:n_groups],
+                grouped_x0[dec_start:n_groups],
+                grouped_ve[dec_start:n_groups] if grouped_ve is not None else None,
+                dec_lams,
+                dec_skips,
+            )
+            x, _ = jax.lax.scan(dec_body, x, dec_in, unroll=spec.scan_unroll)
+        else:
+            def std_body(carry_x, grp):
+                g_blk, g_qb, g_r, g_x0, g_ve = grp
+                cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve)
                 return cur, None
 
             x, _ = jax.lax.scan(
-                group_body_nove, x, (grouped_blocks, grouped_q, grouped_r, grouped_x0), unroll=spec.scan_unroll
+                std_body,
+                x,
+                (grouped_blocks, grouped_q, grouped_r, grouped_x0, grouped_ve),
+                unroll=spec.scan_unroll,
             )
 
     else:
+        skips_list = []
+        half = spec.n_layer // 2
         for i in range(spec.n_layer):
+            if unet_lams is not None and i >= spec.n_layer - half:
+                dec_idx = i - (spec.n_layer - half)
+                x = x + unet_lams[dec_idx].astype(compute_dtype) * skips_list[half - 1 - dec_idx]
             char = "L" if i == spec.n_layer - 1 else pattern[i % G]
             win = short_win if char == "S" else None
             layer_fn = _make_layer_fn(spec, win, compute_dtype, mesh)
             blk_i = jax.tree_util.tree_map(lambda a: a[i], params["blocks"])
             qb_i = jax.tree_util.tree_map(lambda a: a[i], q_blocks) if q_blocks is not None else None
-            ve_tok = ve_table[i][idx] if ve_table is not None else None
+            ve_tok = ve_table[i // ve_stride][idx] if (ve_table is not None and i % ve_stride == 0) else None
             x = layer_fn(blk_i, qb_i, params["resid_lambdas"][i], params["x0_lambdas"][i], x, x0, ve_tok, cos_t, sin_t)
+            if unet_lams is not None and i < half:
+                skips_list.append(x)
 
     return rms_norm(x)
 
@@ -517,10 +571,17 @@ def _make_fused_chunked_loss_fn(softcap: float, z_loss_weight: float):
     return _fused_loss
 
 
-def _make_fused_chunked_loss_int8_bwd_fn(softcap: float, z_loss_weight: float, mesh: Optional[Mesh]):
+def _make_fused_chunked_loss_int8_bwd_fn(
+    softcap: float,
+    z_loss_weight: float,
+    mesh: Optional[Mesh],
+    fast_shared: bool = False,
+):
     """
     Single-pass Cut-Cross-Entropy with 100% exact BF16->FP32 forward logits + softmax,
     and 394-TOPS INT8 MXU backward (`d_x` & `d_lm_w`) using pre-quantized `lm_w_qb`.
+    When `fast_shared=True` (`int8-fast`), quantizes `d_raw` and `xc` ONCE via scalar
+    per-chip scaling and reuses `dr_q` for BOTH `d_x` and `d_lm_w` (zero axis-0 reductions!).
     """
     @jax.custom_vjp
     def _fused_loss(x_ch, lm_w, lm_w_qb, lm_w_sb, y_ch, scale):
@@ -574,14 +635,23 @@ def _make_fused_chunked_loss_int8_bwd_fn(softcap: float, z_loss_weight: float, m
             d_logits = d_logits - jax.nn.one_hot(yc, vocab_size, dtype=jnp.float32)
             d_raw = d_logits * (jnp.float32(1.0) - th * th) if th is not None else d_logits
 
-            # 394-TOPS INT8 backward d_x = d_raw @ lm_w.T (1-byte pre-quantized lm_w_qb!)
-            dr_q, dr_s = quantize_int8(d_raw, axis=-1)
-            dx_i32 = jnp.dot(dr_q, lm_w_qb.T, preferred_element_type=jnp.int32)
-            dx_c = (dx_i32.astype(jnp.float32) * (dr_s * lm_w_sb.T) * tok_scale).astype(xc.dtype)
+            if fast_shared:
+                # Quantize d_raw ONCE & xc ONCE — reuse dr_q for BOTH d_x and d_w!
+                dr_q, dr_s = _quantize_tensor_local(d_raw, mesh)
+                dx_i32 = jnp.dot(dr_q, lm_w_qb.T, preferred_element_type=jnp.int32)
+                dx_c = (_apply_chip_scale(dx_i32.astype(jnp.float32), dr_s, mesh) * lm_w_sb.T * tok_scale).astype(xc.dtype)
+                xq, xs = _quantize_tensor_local(xc, mesh)
+                dw_unnorm = _dw_from_shared_int8(xq, xs, dr_q, dr_s, dw_acc_dtype, mesh)
+            else:
+                # 394-TOPS INT8 backward d_x = d_raw @ lm_w.T (1-byte pre-quantized lm_w_qb!)
+                dr_q, dr_s = quantize_int8(d_raw, axis=-1)
+                dx_i32 = jnp.dot(dr_q, lm_w_qb.T, preferred_element_type=jnp.int32)
+                dx_c = (dx_i32.astype(jnp.float32) * (dr_s * lm_w_sb.T) * tok_scale).astype(xc.dtype)
 
-            # 394-TOPS INT8 backward d_w = x.T @ d_raw (FSDP-local bf16 psum_scatter on v5e-8!)
-            xt_q, xt_s = _quantize_x_for_dw_int8(xc, mesh)
-            dw_unnorm = _dw_from_saved_xt_int8(xt_q, xt_s, d_raw, dw_acc_dtype, mesh)
+                # 394-TOPS INT8 backward d_w = x.T @ d_raw (FSDP-local bf16 psum_scatter on v5e-8!)
+                xt_q, xt_s = _quantize_x_for_dw_int8(xc, mesh)
+                dw_unnorm = _dw_from_saved_xt_int8(xt_q, xt_s, d_raw, dw_acc_dtype, mesh)
+
             dw_acc = dw_acc + (dw_unnorm.astype(jnp.float32) * tok_scale).astype(dw_acc_dtype)
             return (tot_acc + tot_c, ce_acc + ce_c, z_acc + z_c, dw_acc), dx_c
 
@@ -619,7 +689,7 @@ def _pack_fsdp_chunks(x: jax.Array, targets: jax.Array, chunk_sz: int, mesh: Opt
     B, T, C = x.shape
     n_dev = mesh.size if (mesh is not None and mesh.size > 1 and B % mesh.size == 0) else 1
     local_tok = (B // n_dev) * T
-    if chunk_sz <= 0 or local_tok <= chunk_sz or local_tok % chunk_sz != 0:
+    if chunk_sz <= 0 or local_tok < chunk_sz or local_tok % chunk_sz != 0:
         return None
     n_chunks = local_tok // chunk_sz
     x_4d = x.reshape(n_dev, n_chunks, chunk_sz, C).transpose(1, 0, 2, 3)
@@ -651,9 +721,11 @@ def forward_scalar_loss_and_z(
     packed = _pack_fsdp_chunks(x, targets, spec.loss_chunk_size, mesh)
     if packed is not None:
         x_chunks, y_chunks, _, _ = packed
-        if spec.matmul_quant == "int8-all" and q_cache is not None and "lm_head_bwd" in q_cache:
+        if spec.matmul_quant in ("int8-all", "int8-fast") and q_cache is not None and "lm_head_bwd" in q_cache:
             lm_w_qb, lm_w_sb = q_cache["lm_head_bwd"]
-            fused_q_fn = _make_fused_chunked_loss_int8_bwd_fn(spec.softcap, spec.z_loss_weight, mesh)
+            fused_q_fn = _make_fused_chunked_loss_int8_bwd_fn(
+                spec.softcap, spec.z_loss_weight, mesh, fast_shared=(spec.matmul_quant == "int8-fast")
+            )
             return fused_q_fn(x_chunks, lm_w, lm_w_qb, lm_w_sb, y_chunks, scale)
         fused_fn = _make_fused_chunked_loss_fn(spec.softcap, spec.z_loss_weight)
         return fused_fn(x_chunks, lm_w, y_chunks, scale)

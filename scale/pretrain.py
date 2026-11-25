@@ -729,7 +729,7 @@ def main() -> None:
     parser.add_argument("--splash-block-size", type=int, default=None, help="TPU SplashAttention tile size (512/1024)")
     parser.add_argument(
         "--matmul-quant",
-        choices=["none", "int8", "int8-all", "fp8"],
+        choices=["none", "int8", "int8-all", "int8-fast", "fp8"],
         default=None,
         help="Experimental dynamic INT8/FP8 quantized linear GEMMs",
     )

@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P
 
-VALID_MATMUL_QUANT = ("none", "int8", "int8-all", "fp8")
+VALID_MATMUL_QUANT = ("none", "int8", "int8-all", "int8-fast", "fp8")
 LINEAR_BLOCK_KEYS = ("w_qkv", "c_proj", "w_gate_up", "mlp_fc", "mlp_down")
 
 _SHARD_MAP = getattr(jax, "shard_map", None)
@@ -64,6 +64,16 @@ def quantize_int8(x: jax.Array, axis: int):
     return q, scale
 
 
+def quantize_int8_tensor(x: jax.Array):
+    """Single-scalar dynamic absmax int8 quantization (reusable for BOTH fwd/dx AND dw; zero axis-0 reductions!)."""
+    max_abs = jnp.max(jnp.abs(x)).astype(jnp.float32)
+    safe_max = jnp.maximum(max_abs, jnp.float32(1e-8))
+    inv_scale = jnp.float32(127.0) / safe_max
+    scale = (safe_max * jnp.float32(1.0 / 127.0)).reshape((1, 1))
+    q = jnp.clip(jnp.rint(x.astype(jnp.float32) * inv_scale), -127.0, 127.0).astype(jnp.int8)
+    return q, scale
+
+
 def quantize_fp8(x: jax.Array, axis: int, fp8_dtype, max_val: float):
     """Fast symmetric dynamic absmax fp8 quantization along `axis` via reciprocal multiply."""
     max_abs = jnp.max(jnp.abs(x), axis=axis, keepdims=True).astype(jnp.float32)
@@ -79,7 +89,7 @@ def prequantize_weight_pair(w: jax.Array, mode: str) -> Optional[tuple[jax.Array
     Pre-quantize a weight tensor `w` with trailing `(..., K, N)` dims into
     `(w_q_fwd, w_s_fwd, w_q_bwd, w_s_bwd)` ONCE per optimizer step.
     """
-    if mode in ("int8", "int8-all"):
+    if mode in ("int8", "int8-all", "int8-fast"):
         w_qf, w_sf = quantize_int8(w, axis=-2)
         w_qb, w_sb = quantize_int8(w, axis=-1)
         return (w_qf, w_sf, w_qb, w_sb)
@@ -92,7 +102,7 @@ def prequantize_weight_pair(w: jax.Array, mode: str) -> Optional[tuple[jax.Array
 
 def prequantize_model_weights(params: dict, mode: str, tie_embeddings: bool = False) -> Optional[dict]:
     """
-    Pre-quantize all scanned block linear weights (+ lm_head bwd weight for `int8-all`)
+    Pre-quantize all scanned block linear weights (+ lm_head bwd weight for `int8-all` / `int8-fast`)
     ONCE before the gradient-accumulation scan so microsteps read 1-byte weights and
     multi-chip FSDP AllGathers 1 byte/weight instead of 2 bytes BF16.
     """
@@ -106,7 +116,7 @@ def prequantize_model_weights(params: dict, mode: str, tie_embeddings: bool = Fa
             q_blocks[k] = prequantize_weight_pair(blocks[k], mode)
 
     q_cache = {"blocks": q_blocks}
-    if mode == "int8-all":
+    if mode in ("int8-all", "int8-fast"):
         lm_w = params["wte"].T if tie_embeddings else params["lm_head"]
         q_cache["lm_head_bwd"] = quantize_int8(lm_w, axis=-1)
     return q_cache
@@ -336,6 +346,32 @@ def _make_qdot_prequant(mode: str, mesh: Optional[Mesh]):
         _fn.defvjp(_fwd, _bwd)
         return _fn
 
+    if mode == "int8-fast":
+        @jax.custom_vjp
+        def _fn(x, w_unused, w_qf, w_sf, w_qb, w_sb):
+            x_q, x_s = _quantize_tensor_local(x, mesh)
+            y_i32 = jnp.dot(x_q, w_qf, preferred_element_type=jnp.int32)
+            return (_apply_chip_scale(y_i32.astype(jnp.float32), x_s, mesh) * w_sf).astype(x.dtype)
+
+        def _fwd(x, w_unused, w_qf, w_sf, w_qb, w_sb):
+            # Quantize x ONCE per layer (1-byte int8) — reused directly for BOTH fwd AND bwd d_w!
+            x_q, x_s = _quantize_tensor_local(x, mesh)
+            y_i32 = jnp.dot(x_q, w_qf, preferred_element_type=jnp.int32)
+            y = (_apply_chip_scale(y_i32.astype(jnp.float32), x_s, mesh) * w_sf).astype(x.dtype)
+            return y, (x_q, x_s, w_qb, w_sb)
+
+        def _bwd(res, g):
+            x_q, x_s, w_qb, w_sb = res
+            # Quantize g ONCE per layer (1-byte int8) — reused directly for BOTH d_x AND d_w!
+            g_q, g_s = _quantize_tensor_local(g, mesh)
+            dx_i32 = jnp.dot(g_q, w_qb.T, preferred_element_type=jnp.int32)
+            dx = (_apply_chip_scale(dx_i32.astype(jnp.float32), g_s, mesh) * w_sb.T).astype(g.dtype)
+            dw = _dw_from_shared_int8(x_q, x_s, g_q, g_s, g.dtype, mesh)
+            return dx, dw, None, None, None, None
+
+        _fn.defvjp(_fwd, _bwd)
+        return _fn
+
     if mode == "fp8":
         @jax.custom_vjp
         def _fn(x, w_unused, w_qf, w_sf, w_qb, w_sb):
@@ -362,6 +398,90 @@ def _make_qdot_prequant(mode: str, mesh: Optional[Mesh]):
     raise ValueError(f"Unsupported prequantized matmul_quant mode: {mode!r}")
 
 
+def _quantize_tensor_local(x: jax.Array, mesh: Optional[Mesh]):
+    """Per-chip scalar absmax int8 quantization (`x_q`: `(M, K)`, `x_s`: `(n_dev, 1)` or `(1, 1)`)."""
+    if mesh is not None and mesh.size > 1 and x.shape[0] % mesh.size == 0:
+        axis_name = mesh.axis_names[0]
+        return _SHARD_MAP(
+            quantize_int8_tensor,
+            mesh=mesh,
+            in_specs=P(axis_name, None),
+            out_specs=(P(axis_name, None), P(axis_name, None)),
+            **_SHARD_MAP_KWARGS,
+        )(x)
+    return quantize_int8_tensor(x)
+
+
+def _apply_chip_scale(arr_2d: jax.Array, s_chip: jax.Array, mesh: Optional[Mesh]) -> jax.Array:
+    """Multiply 2D `(M, N)` by per-chip scalar `(n_dev, 1)` (or `(1, 1)` on 1 chip) with zero comm."""
+    if mesh is not None and mesh.size > 1 and s_chip.shape[0] == mesh.size:
+        n_dev = mesh.size
+        return (arr_2d.reshape(n_dev, -1, arr_2d.shape[-1]) * s_chip[:, None, :]).reshape(arr_2d.shape)
+    return arr_2d * s_chip
+
+
+def _dw_from_shared_int8(
+    x_q: jax.Array,
+    x_s: jax.Array,
+    g_q: jax.Array,
+    g_s: jax.Array,
+    out_dtype,
+    mesh: Optional[Mesh],
+) -> jax.Array:
+    """Compute `d_w = x_q.T @ g_q` reusing BOTH `x_q` and `g_q` (zero extra quants; bf16 psum_scatter on FSDP!)."""
+    k_dim = x_q.shape[1]
+    n_dim = g_q.shape[1]
+    if mesh is not None and mesh.size > 1 and x_q.shape[0] % mesh.size == 0:
+        sd = _choose_dw_scatter_dim(k_dim, n_dim, mesh.size)
+        if sd is not None:
+            axis_name = mesh.axis_names[0]
+            out_spec = P(axis_name, None) if sd == 0 else P(None, axis_name)
+
+            def local_dw(xq_loc, xs_loc, gq_loc, gs_loc):
+                dw_i32 = jnp.dot(xq_loc.T, gq_loc, preferred_element_type=jnp.int32)
+                dw_loc = (dw_i32.astype(jnp.float32) * (xs_loc * gs_loc)).astype(out_dtype)
+                return jax.lax.psum_scatter(dw_loc, axis_name, scatter_dimension=sd, tiled=True)
+
+            return _SHARD_MAP(
+                local_dw,
+                mesh=mesh,
+                in_specs=(P(axis_name, None), P(axis_name, None), P(axis_name, None), P(axis_name, None)),
+                out_specs=out_spec,
+                **_SHARD_MAP_KWARGS,
+            )(x_q, x_s, g_q, g_s)
+
+    dw_i32 = jnp.dot(x_q.T, g_q, preferred_element_type=jnp.int32)
+    return (dw_i32.astype(jnp.float32) * (x_s * g_s)).astype(out_dtype)
+
+
+def _make_qdot_int8_fast(mesh: Optional[Mesh]):
+    @jax.custom_vjp
+    def _fn(x: jax.Array, w: jax.Array) -> jax.Array:
+        x_q, x_s = _quantize_tensor_local(x, mesh)
+        w_q, w_s = quantize_int8(w, axis=0)
+        y_i32 = jnp.dot(x_q, w_q, preferred_element_type=jnp.int32)
+        return (_apply_chip_scale(y_i32.astype(jnp.float32), x_s, mesh) * w_s).astype(x.dtype)
+
+    def _fwd(x: jax.Array, w: jax.Array):
+        x_q, x_s = _quantize_tensor_local(x, mesh)
+        w_q, w_s = quantize_int8(w, axis=0)
+        y_i32 = jnp.dot(x_q, w_q, preferred_element_type=jnp.int32)
+        y = (_apply_chip_scale(y_i32.astype(jnp.float32), x_s, mesh) * w_s).astype(x.dtype)
+        return y, (x_q, x_s, w)
+
+    def _bwd(res, g: jax.Array):
+        x_q, x_s, w = res
+        g_q, g_s = _quantize_tensor_local(g, mesh)
+        w_q, w_s = quantize_int8(w, axis=-1)
+        dx_i32 = jnp.dot(g_q, w_q.T, preferred_element_type=jnp.int32)
+        dx = (_apply_chip_scale(dx_i32.astype(jnp.float32), g_s, mesh) * w_s.T).astype(g.dtype)
+        dw = _dw_from_shared_int8(x_q, x_s, g_q, g_s, w.dtype, mesh)
+        return dx, dw
+
+    _fn.defvjp(_fwd, _bwd)
+    return _fn
+
+
 def qdot(
     x: jax.Array,
     w: jax.Array,
@@ -383,6 +503,8 @@ def qdot(
         return _qdot_int8_hybrid(x, w)
     if mode == "int8-all":
         return _make_qdot_int8_all(mesh)(x, w)
+    if mode == "int8-fast":
+        return _make_qdot_int8_fast(mesh)(x, w)
     if mode == "fp8":
         return _qdot_fp8(x, w)
     raise ValueError(f"Unsupported matmul_quant mode: {mode!r}. Choose from {VALID_MATMUL_QUANT}")

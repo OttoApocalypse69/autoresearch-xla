@@ -52,6 +52,8 @@ def init_opt_state(params: dict, opt_dtype=jnp.float32) -> dict:
         state["lm_head"] = adamw_zeros(params["lm_head"])
     if "value_embeds" in params:
         state["value_embeds"] = adamw_zeros(params["value_embeds"])
+    if "unet_lambdas" in params:
+        state["unet_lambdas"] = adamw_zeros(params["unet_lambdas"])
     return state
 
 
@@ -214,6 +216,11 @@ def optimizer_step(
         params["x0_lambdas"], grads["x0_lambdas"], opt_state["x0_lambdas"], step_f,
         tcfg.scalar_lr * lrm, 0.96, 0.95, next_sr_key(),
     )
+    if "unet_lambdas" in params:
+        new_params["unet_lambdas"], new_state["unet_lambdas"] = _adamw_update(
+            params["unet_lambdas"], grads["unet_lambdas"], opt_state["unet_lambdas"], step_f,
+            tcfg.scalar_lr * lrm, 0.96, 0.95, next_sr_key(),
+        )
 
     new_blocks, st_blocks = {}, {}
     for name in params["blocks"]:

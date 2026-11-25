@@ -29,7 +29,9 @@ class ModelSpec:
     window_pattern: str = "L"        # "L" (full), "SL", or "SSSL"
     use_qk_norm: bool = True
     use_value_embeds: bool = False   # ResFormer value embeddings (alternating/periodic)
+    ve_stride: int = 1               # 1=every layer, 2=alternating layers (halves VE params & HBM!)
     use_resid_lambdas: bool = True   # Per-layer residual + x0 skip scalars (nanochat)
+    use_unet_skip: bool = False      # Modded-nanogpt symmetric encoder->decoder U-Net skip connections
     tie_embeddings: bool = False     # Tie wte & lm_head weights
     rope_base: float = 10000.0
     softcap: float = 15.0            # 0.0 disables logit softcapping
@@ -39,7 +41,7 @@ class ModelSpec:
     attn_impl: str = "auto"          # "auto" (Splash on TPU, cuDNN on Ampere+ GPU, XLA fallback) | "splash" | "cudnn" | "xla"
     loss_chunk_size: int = 2048      # Chunked linear CE token count (0 disables; 2048 cuts logits HBM by ~8-16x!)
     splash_block_size: int = 1024    # TPU Pallas SplashAttention VMEM tile size (auto-clamped to seq_len)
-    matmul_quant: str = "none"       # Experimental linear GEMM quant: "none" | "int8" | "int8-all" | "fp8"
+    matmul_quant: str = "none"       # Experimental linear GEMM quant: "none" | "int8" | "int8-all" | "int8-fast" | "fp8"
     scan_unroll: int = 1             # jax.lax.scan layer unroll factor (1 or 2 for pipeline overlap)
 
     def __post_init__(self) -> None:
@@ -50,8 +52,9 @@ class ModelSpec:
         valid_remat = ("none", "save_all_compute", "save_attn", "save_qkv_attn", "dots_with_no_batch_dims", "dots", "full")
         assert self.remat_policy in valid_remat, f"Invalid remat_policy: {self.remat_policy!r}"
         assert self.attn_impl in ("auto", "splash", "cudnn", "xla"), f"Invalid attn_impl: {self.attn_impl!r}"
-        assert self.matmul_quant in ("none", "int8", "int8-all", "fp8"), f"Invalid matmul_quant: {self.matmul_quant!r}"
+        assert self.matmul_quant in ("none", "int8", "int8-all", "int8-fast", "fp8"), f"Invalid matmul_quant: {self.matmul_quant!r}"
         assert self.scan_unroll >= 1, f"scan_unroll must be >= 1, got {self.scan_unroll}"
+        assert self.ve_stride >= 1, f"ve_stride must be >= 1, got {self.ve_stride}"
 
     @property
     def head_dim(self) -> int:
