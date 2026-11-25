@@ -28,11 +28,16 @@ import os
 # ---------------------------------------------------------------------------
 
 _DEFAULT_TPU_XLA_FLAGS = (
+    "--xla_tpu_enable_data_parallel_all_reduce_opt=true "
+    "--xla_tpu_data_parallel_opt_different_sized_ops=true "
     "--xla_tpu_enable_async_collective_fusion=true "
     "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "
     "--xla_tpu_enable_async_collective_fusion_multiple_steps=true "
     "--xla_tpu_overlap_compute_collective_tc=true "
-    "--xla_enable_async_all_gather=true"
+    "--xla_enable_async_all_gather=true "
+    "--xla_tpu_enable_ag_backward_pipelining=true "
+    "--xla_tpu_enable_windowed_einsum_for_all_gather=true "
+    "--xla_tpu_enable_windowed_einsum_for_reduce_scatter=true"
 )
 if not os.environ.get("LIBTPU_INIT_ARGS"):
     os.environ["LIBTPU_INIT_ARGS"] = _DEFAULT_TPU_XLA_FLAGS
