@@ -34,13 +34,21 @@ class ModelSpec:
     rope_base: float = 10000.0
     softcap: float = 15.0            # 0.0 disables logit softcapping
     z_loss_weight: float = 1e-4      # Auxiliary router/logit stability loss (0.0 disables)
-    use_remat: bool = True           # Gradient checkpointing per scanned layer
+    use_remat: bool = True           # Legacy bool (overridden when remat_policy != "auto")
+    remat_policy: str = "dots_with_no_batch_dims"  # "none" | "dots_with_no_batch_dims" | "dots" | "full"
+    attn_impl: str = "auto"          # "auto" (Splash on TPU, cuDNN on Ampere+ GPU, XLA fallback) | "splash" | "cudnn" | "xla"
+    loss_chunk_size: int = 2048      # Chunked linear CE token count (0 disables; 2048 cuts logits HBM by ~8-16x!)
+    splash_block_size: int = 512     # TPU Pallas SplashAttention VMEM tile size (128/256/512)
 
     def __post_init__(self) -> None:
         assert self.n_embd % self.n_head == 0, f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"
         assert self.n_head % self.n_kv_head == 0, f"n_head ({self.n_head}) must be divisible by n_kv_head ({self.n_kv_head})"
         assert self.activation in ("swiglu", "relu2", "gelu"), f"Unsupported activation: {self.activation!r}"
         assert all(c in "SL" for c in self.window_pattern.upper()), f"Invalid window_pattern: {self.window_pattern!r}"
+        assert self.remat_policy in ("none", "dots_with_no_batch_dims", "dots", "full"), (
+            f"Invalid remat_policy: {self.remat_policy!r}"
+        )
+        assert self.attn_impl in ("auto", "splash", "cudnn", "xla"), f"Invalid attn_impl: {self.attn_impl!r}"
 
     @property
     def head_dim(self) -> int:
@@ -84,7 +92,8 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         activation="swiglu",
         window_pattern="SL",
         use_value_embeds=False,
-        use_remat=True,
+        remat_policy="dots_with_no_batch_dims",
+        loss_chunk_size=128,
     ),
     # ~126M proxy model (fast validation on Colab T4 / TPU v5e-1)
     "100m": ModelSpec(
@@ -98,7 +107,8 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         activation="swiglu",
         window_pattern="L",
         use_value_embeds=False,
-        use_remat=True,
+        remat_policy="none",
+        loss_chunk_size=2048,
     ),
     # ~367M mid-scale model (great for 1-session Colab A100 / v6e-1 sanity runs)
     "350m": ModelSpec(
@@ -112,7 +122,8 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         activation="swiglu",
         window_pattern="L",
         use_value_embeds=False,
-        use_remat=True,
+        remat_policy="dots_with_no_batch_dims",
+        loss_chunk_size=2048,
     ),
     # ~1.036B flagship base model (optimal for Kaggle TPU v5e-8 FSDP & Colab v6e-1/H100)
     "1b": ModelSpec(
@@ -126,9 +137,10 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         activation="swiglu",
         window_pattern="L",
         use_value_embeds=False,
-        use_remat=True,
+        remat_policy="dots_with_no_batch_dims",
+        loss_chunk_size=2048,
     ),
-    # ~1.015B ReLU^2 + Value-Embedding nanochat-style variant
+    # ~1.015B ReLU^2 + sliding-window nanochat-style variant
     "1b-relu2": ModelSpec(
         sequence_len=2048,
         vocab_size=32768,
@@ -140,7 +152,8 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         activation="relu2",
         window_pattern="SL",
         use_value_embeds=False,
-        use_remat=True,
+        remat_policy="dots_with_no_batch_dims",
+        loss_chunk_size=2048,
     ),
 }
 

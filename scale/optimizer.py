@@ -81,14 +81,16 @@ def _muon_update_2d(p, g, m_buf, v_buf, lr, momentum, wd, ns_dtype, beta2, ns_st
     rows, cols = p.shape
     if rows > cols:
         for a, b, c in POLAR_EXPRESS_COEFFS[:ns_steps]:
+            a_t, b_t, c_t = jnp.asarray(a, ns_dtype), jnp.asarray(b, ns_dtype), jnp.asarray(c, ns_dtype)
             A = X.T @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
+            B = b_t * A + c_t * (A @ A)
+            X = a_t * X + X @ B
     else:
         for a, b, c in POLAR_EXPRESS_COEFFS[:ns_steps]:
+            a_t, b_t, c_t = jnp.asarray(a, ns_dtype), jnp.asarray(b, ns_dtype), jnp.asarray(c, ns_dtype)
             A = X @ X.T
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
+            B = b_t * A + c_t * (A @ A)
+            X = a_t * X + B @ X
 
     g_orth = X.astype(jnp.float32)
 

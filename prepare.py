@@ -113,11 +113,11 @@ def _estimate_peak_tflops_and_profile(platform: str, kind: str, num_devices: int
             # TPU v5e (Colab free v5e-1: 16GB; Kaggle free v5e-8: 8x16GB=128GB)
             per_dev_tflops = 197.0
             if num_devices >= 8:
-                depth, per_dev_batch, total_batch, remat = 8, 8, 2**19, False
+                depth, per_dev_batch, total_batch, remat = 8, 16, 2**19, False
             elif num_devices >= 4:
-                depth, per_dev_batch, total_batch, remat = 8, 8, 2**18, False
+                depth, per_dev_batch, total_batch, remat = 8, 16, 2**18, False
             else:
-                depth, per_dev_batch, total_batch, remat = 6, 8, 2**17, True
+                depth, per_dev_batch, total_batch, remat = 6, 16, 2**17, False
         elif "v5p" in k or "v5" in k:
             per_dev_tflops = 459.0
             depth, per_dev_batch, total_batch, remat = 8, 16, 2**19, False
@@ -145,24 +145,27 @@ def _estimate_peak_tflops_and_profile(platform: str, kind: str, num_devices: int
             return "bfloat16", 2250.0 * num_devices, 10, 2**19, 32, "SSSL", False
         if "h200" in k or "h100" in k:
             return "bfloat16", 989.5 * num_devices, 8, 2**19, 32, "SSSL", False
+        if "rtx pro 6000" in k or ("6000" in k and "blackwell" in k):
+            # Colab G4: NVIDIA RTX PRO 6000 Blackwell (96GB GDDR7, 504 TFLOPS dense bf16)
+            return "bfloat16", 504.0 * num_devices, 8, 2**19, 32, "SSSL", False
         if "a100" in k:
             per_dev_batch = 32 if hbm_gb >= 70 else 16
             return "bfloat16", 312.0 * num_devices, 8, 2**18, per_dev_batch, "SSSL", False
         if "l40" in k:
             return "bfloat16", 181.0 * num_devices, 8, 2**18, 16, "SSSL", False
         if "l4" in k:
-            return "bfloat16", 121.0 * num_devices, 6, 2**17, 8, "SSSL", True
-        if "a10" in k or "rtx 40" in k or "rtx 50" in k or "rtx 30" in k:
+            return "bfloat16", 121.0 * num_devices, 6, 2**17, 16, "SSSL", False
+        if "a10" in k or "rtx 40" in k or "rtx 50" in k or "rtx 30" in k or "blackwell" in k:
             return "bfloat16", 125.0 * num_devices, 6, 2**17, 8, "SSSL", True
         if "v100" in k:
             return "float16", 125.0 * num_devices, 6, 2**17, 8, "L", True
         if "t4" in k:
-            # Colab T4 (1x16GB) or Kaggle 2xT4 (2x16GB): use fp16 Tensor Cores + remat
+            # Colab T4 (1x16GB) or Kaggle 2xT4 (2x16GB): fp16 Tensor Cores, no remat needed at depth=4..6
             if num_devices >= 2:
-                return "float16", 65.0 * num_devices, 6, 2**16, 4, "L", True
-            return "float16", 65.0 * num_devices, 4, 2**15, 4, "L", True
+                return "float16", 65.0 * num_devices, 6, 2**16, 8, "L", False
+            return "float16", 65.0 * num_devices, 4, 2**15, 8, "L", False
         if "p100" in k:
-            # Kaggle P100 (16GB, SM 6.0): no fp16 tensor cores, fp16 ALU is 2x fp32
+            # Kaggle P100 (16GB, SM 6.0): fp16 ALU is 2x fp32
             return "float16", 21.2 * num_devices, 4, 2**15, 4, "L", True
         # Unknown modern GPU fallback
         return "bfloat16", 100.0 * num_devices, 6, 2**17, 8, "L", True

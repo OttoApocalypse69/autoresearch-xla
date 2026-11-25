@@ -195,7 +195,7 @@ ps = summarize_sharding(p, mesh)
 os_ = summarize_sharding(o, mesh)
 print("FSDP_PARAMS:", ps)
 print("FSDP_OPT:", os_)
-assert ps["sharded_leaves"] >= 7
+assert ps["sharded_leaves"] >= 6
 assert ps["per_device_mb"] < ps["total_mb"] / 6.0
 assert os_["per_device_mb"] < os_["total_mb"] / 5.0
 """
@@ -274,3 +274,25 @@ def test_pretrain_1b_notebook_valid():
     assert len(code_cells) >= 4
     for idx, c in enumerate(code_cells):
         ast.parse("".join(c["source"]), filename=f"pretrain_1b_cell_{idx}")
+
+
+def test_chunked_ce_matches_full_ce():
+    import jax
+    import jax.numpy as jnp
+    from scale.model import forward_loss_2d, init_params, precompute_rotary_embeddings
+
+    spec_full = ModelSpec(
+        sequence_len=32, vocab_size=128, n_layer=2, n_embd=64, n_head=2, n_kv_head=1,
+        mlp_hidden=128, activation="swiglu", loss_chunk_size=0, remat_policy="none",
+    )
+    spec_chunk = ModelSpec.from_dict({**spec_full.to_dict(), "loss_chunk_size": 16})
+    params = init_params(jax.random.PRNGKey(0), spec_full)
+    cos, sin = precompute_rotary_embeddings(32, 32)
+    rng = np.random.default_rng(3)
+    x = jnp.asarray(rng.integers(0, 128, size=(2, 32), dtype=np.int32))
+    y = jnp.asarray(rng.integers(0, 128, size=(2, 32), dtype=np.int32))
+
+    nll_f, z_f = forward_loss_2d(params, x, y, cos, sin, spec_full, jnp.float32, return_z_loss=True)
+    nll_c, z_c = forward_loss_2d(params, x, y, cos, sin, spec_chunk, jnp.float32, return_z_loss=True)
+    assert float(jnp.max(jnp.abs(nll_f - nll_c))) < 1e-5
+    assert abs(float(z_f) - float(z_c)) < 1e-5

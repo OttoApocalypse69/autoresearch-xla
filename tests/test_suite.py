@@ -45,6 +45,7 @@ import prepare  # noqa: E402
         ("tpu", "TPU v3", 8, 16.0, "bfloat16", 8),
         ("tpu", "TPU v2", 8, 8.0, "bfloat16", 6),
         ("gpu", "NVIDIA H100 80GB HBM3", 1, 80.0, "bfloat16", 8),
+        ("gpu", "NVIDIA RTX PRO 6000 Blackwell Server Edition", 1, 96.0, "bfloat16", 8),
         ("gpu", "NVIDIA A100-SXM4-40GB", 1, 40.0, "bfloat16", 8),
         ("gpu", "NVIDIA L4", 1, 24.0, "bfloat16", 6),
         ("gpu", "Tesla T4", 2, 16.0, "float16", 6),
