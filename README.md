@@ -35,13 +35,14 @@ Out of the box (`DEPTH = None`, `TOTAL_BATCH_SIZE = None`), `train.py` detects y
 | `TPU v5e-8` | Kaggle (Free) | 8 TPU | `bfloat16` | ~1,576 | 8 | 524,288 | Off |
 | `TPU v6e-1` | Colab Pro | 1 TPU | `bfloat16` | ~918 | 8 | 524,288 | Off |
 | `H100` | Colab Pro+ | 1 GPU | `bfloat16` | ~989 | 8 | 524,288 | Off |
+| `RTX PRO 6000 (G4)` | Colab Pro+ | 1 GPU (96 GB) | `bfloat16` | ~504 | 8 | 524,288 | Off |
 | `TPU v3-8` | Kaggle (Free) | 8 TPU | `bfloat16` | ~492 | 8 | 262,144 | On |
 | `A100` | Colab Pro | 1 GPU | `bfloat16` | ~312 | 8 | 262,144 | Off |
-| `TPU v5e-1` | Colab (Free) | 1 TPU | `bfloat16` | ~197 | 6 | 131,072 | On |
+| `TPU v5e-1` | Colab (Free) | 1 TPU | `bfloat16` | ~197 | 6 | 131,072 | Off |
 | `TPU v2-8` | Colab (Free) | 8 TPU | `bfloat16` | ~180 | 6 | 131,072 | On |
-| `2× T4` | Kaggle (Free) | 2 GPU | `float16` | ~130 | 6 | 65,536 | On |
+| `2× T4` | Kaggle (Free) | 2 GPU | `float16` | ~130 | 6 | 65,536 | Off |
 | `L4` | Colab Pro | 1 GPU | `bfloat16` | ~121 | 6 | 131,072 | On |
-| `T4` / `P100` | Colab / Kaggle | 1 GPU | `float16` | ~65 / 21 | 4 | 32,768 | On |
+| `T4` / `P100` | Colab / Kaggle | 1 GPU | `float16` | ~65 / 21 | 4 | 32,768 | Off / On |
 | `CPU` | Local / CI | N CPU | `float32` | ~0.5/core | 2 | 1,024+ | Off |
 
 ## Quickstart
@@ -49,7 +50,7 @@ Out of the box (`DEPTH = None`, `TOTAL_BATCH_SIZE = None`), `train.py` detects y
 ### Option 1: Google Colab or Kaggle Notebook (Recommended)
 
 1. Open `autoresearch_colab_kaggle.ipynb` in Google Colab or Kaggle Notebooks.
-2. Select any **GPU** or **TPU** runtime (`T4`, `2×T4`, `L4`, `A100`, `TPU v5e-1`, `TPU v5e-8`, etc.).
+2. Select any **GPU** or **TPU** runtime (`T4`, `2×T4`, `L4`, `A100`, `G4`, `TPU v5e-1`, `TPU v5e-8`, etc.).
 3. Add one API key to **Colab Secrets** or **Kaggle Secrets**:
    - `GEMINI_API_KEY` (Google AI Studio)
    - `ANTHROPIC_API_KEY` (Claude)
@@ -88,7 +89,7 @@ Run directly from your local terminal against remote Colab or Kaggle accelerator
 ```bash
 # Google Colab CLI (https://github.com/googlecolab/google-colab-cli)
 uv tool install google-colab-cli
-colab new -s autoresearch --tpu v5e1   # or --gpu T4 / L4 / A100 / H100
+colab new -s autoresearch --tpu v5e1   # or --gpu T4 / L4 / A100 / H100 / G4
 colab exec -s autoresearch -f autoresearch_colab_kaggle.ipynb
 colab stop -s autoresearch             # always release the VM when finished
 
@@ -101,28 +102,59 @@ kaggle kernels push -p . --accelerator TpuV5E8   # or NvidiaTeslaT4 (2xT4 GPU)
 
 ## Scaling Up to 1B+ Parameters (`scale/`)
 
-Once `autoresearch-xla` discovers a strong architecture/optimizer recipe at proxy scale, scale it up with the resumable multi-chip **1D FSDP pretraining engine** ([`scale/pretrain.py`](scale/pretrain.py) & [`pretrain_1b_colab_kaggle.ipynb`](pretrain_1b_colab_kaggle.ipynb)):
+Once `autoresearch-xla` discovers a strong architecture/optimizer recipe at proxy scale, scale it up with the high-MFU resumable multi-chip **1D FSDP pretraining engine** ([`scale/pretrain.py`](scale/pretrain.py) & [`pretrain_1b_colab_kaggle.ipynb`](pretrain_1b_colab_kaggle.ipynb)):
 
-- **True 1D FSDP across 8 TPU chips / multi-GPU**: Shards 1.036B weights + NorMuon/AdamW states across 8 chips on Kaggle TPU `v5e-8` (**~1.15 GB/chip** static HBM out of 16 GB/chip) and uses `jax.lax.scan` over layers + per-layer `jax.checkpoint` for ~20s compile times.
-- **Disk-bounded ClimbMix streaming**: Streams shards from `karpathy/climbmix-400b-shuffle` using a rolling ~200 MB `/tmp` cache + exact resumable `DataCursor` (never fills Kaggle's 20 GB disk).
-- **WSD (Warmup → Stable → Decay)**: Train across unlimited 9h Kaggle / 12h Colab sessions in `--phase stable`, then run `--phase decay` for the final ~10% cooldown tokens.
-- **Topology-agnostic checkpoints**: Syncs weights (`safetensors`/`npz`), optimizer state, tokenizer, and shard cursor to **HuggingFace Hub** (`--sync-backend hf`), **Google Drive** (`--sync-backend local`), or **Kaggle Datasets** (`--sync-backend kaggle`) — seamlessly hop between Kaggle TPU `v5e-8` and Colab `v6e-1`/`H100` across sessions!
+- **True 1D FSDP across 8 TPU chips / multi-GPU**: Shards 1.036B weights + NorMuon/AdamW states across 8 chips on Kaggle TPU `v5e-8` (**~1.05 GB/chip** static HBM in fp32, or **~525 MB/chip** in pure BF16+SR!) — and fits **1.036B on a single 16 GB Colab TPU `v5e-1` at `67.46%` pure-BF16 MFU (`80.25%` BF16-eq with INT8)!**
+- **Full MFU & Experimental Stack**:
+  - Fused `w_qkv` & SwiGLU `w_gate_up` projections (all dims 256-aligned for TPU v5e/v6e MXUs & NVIDIA Tensor Cores)
+  - Auto-dispatched **Pallas TPU `SplashAttention(1024)`** (fused backward kernel + `shard_map` FSDP) & **GPU `cuDNN FlashAttention`** (also wired into proxy `train.py`!)
+  - **Flash/Splash-aware split rematerialization**: `save_all_compute` (0% GEMM & 0% Attention recompute, ~3× lower HBM than `none` by discarding redundant `silu`/`rms_norm` buffers) and `save_attn` (0% Attention/QKV recompute, ~7.5× lower HBM)
+  - **Single-pass FSDP Fused Cut-Cross-Entropy** (`@jax.custom_vjp`): 0% `lm_head` backward recomputation, zero cross-chip resharding, and ~16× lower logits HBM (`~268 MB` vs `4.3 GB`)
+  - **Experimental Pure-BF16 Master Weights + Unbiased Stochastic Rounding** (`--param-dtype bfloat16`, [`scale/quant.py`](scale/quant.py)): cuts 1B weight HBM by ~3× (`5.93 GB → 1.98 GB`), eliminates `fp32→bf16` staging casts, and unlocks `save_all_compute` even on a single 16 GB chip
+  - **Experimental Dynamic INT8 / FP8 Quantized GEMMs** (`--matmul-quant int8 | int8-all | fp8`): unlocks TPU `v5e`'s **394 TOPS INT8** MXU (`+20%` faster over 66.7% BF16 with `<0.0001` loss delta!) and TPU `v6e` / Blackwell `G4` FP8 Tensor Cores
+  - All 10 verified MaxText TPU `v5e-8` FSDP flags (`windowed_einsum` + backward AllGather pipelining + async collective fusion), 90% GPU VRAM preallocation, optional `--muon-vmap`, and async H2D double-buffering
+- **Disk-bounded Multi-Dataset Streaming Mixer** ([`scale/data.py`](scale/data.py)): Deterministic smooth-weighted streaming across public, ungated HF Parquet corpora with exact per-source resumable `DataCursor` and rolling `/tmp` cleanup (`< 2 GB` total disk on Kaggle's 20 GB cap!):
+  - `mix-1b` *(recommended 1B stable phase)*: `65%` ClimbMix-400B + `15%` CodeParrot-Clean (Python) + `10%` FineMath-4plus + `10%` Cosmopedia-v2
+  - `mix-cooldown` *(recommended WSD decay phase)*: `40%` ClimbMix + `20%` Cosmopedia-v2 + `20%` FineMath-4plus + `20%` CodeParrot
+  - `mix-code`: `50%` ClimbMix + `25%` CodeParrot + `15%` The-Stack-Smol-XL + `10%` FineMath-4plus
+  - Or pass any single source (`climbmix`, `codeparrot`, `stack-code`, `finemath`, `cosmopedia`, `fineweb-edu`, `tinystories`, `synthetic`) or inline mix (`--dataset "climbmix:0.7,codeparrot:0.2,finemath:0.1"`). All mixes evaluate `val_bpb` on ClimbMix's pinned `shard_06542` for apples-to-apples tracking.
+- **WSD (Warmup → Stable → Decay)** + **Topology-agnostic checkpoints**: Syncs weights (`safetensors`/`npz`), optimizer state, tokenizer, and multi-source cursor to **HuggingFace Hub** (`--sync-backend hf`), **Google Drive** (`--sync-backend local`), or **Kaggle Datasets** (`--sync-backend kaggle`).
+
+### Verified Live MFU Benchmarks (Real Colab & Kaggle Hardware)
+
+| Hardware | Model / Engine | Configuration | Throughput | MFU |
+|---|---|---|---:|---:|
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | Proxy `train.py` (depth=6) | Baseline (unfused XLA attention) | 226,200 tok/s | 13.81% |
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | Proxy `train.py` (depth=6) | **+ Pallas `SplashAttention(1024)`** | **694,000 tok/s** | **39.58%** (**3.07×**) |
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` `350M` (367M) | Baseline (`xla` + `full` remat + unchunked CE) | 23,296 tok/s | 29.02% |
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` `350M` (367M) | `Splash(1024)` + `save_all_compute` + Fused Cut-CE (`b=4`) | 48,059 tok/s | 59.86% (**2.06×**) |
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` **`1B` (1.036B)** | `Splash(1024)` + `save_attn` + Fused Cut-CE (`fp32 w`, `bf16 opt`, `b=2`) | 18,138 tok/s | 62.79% |
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` **`1B` (1.036B)** | **`BF16+SR` + `save_all_compute` + `Splash(1024)` + Fused Cut-CE (512K batch)** | **19,485 tok/s** | **67.46%** (pure BF16) |
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` **`1B` (1.036B)** | **Experimental `--matmul-quant int8` (INT8 fwd/dx + BF16 dw)** | **20,870 tok/s** | **72.25%** *(BF16-eq)* |
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` **`1B` (1.036B)** | **Experimental `--matmul-quant int8-all` (394 TOPS INT8 MXU)** | **23,182 tok/s** | **80.25%** *(BF16-eq)* |
+| **Colab GPU `L4`** (24 GB, 121 TF) | `scale/` `350M` (367M) | Baseline (`xla` + `full` remat + unchunked CE) | 6,196 tok/s | 12.56% |
+| **Colab GPU `L4`** (24 GB, 121 TF) | `scale/` `350M` (367M) | `cuDNN FlashAttention` + `save_attn` + chunked CE (`b=8`) | 10,885 tok/s | 22.07% (**1.76×**) |
+| **Kaggle `2× T4`** (32 GB, 130 TF) | Proxy `train.py` (26.3M) | Multi-GPU SPMD `float16` + dynamic loss scaling | 95,000 tok/s | 9.90% |
+| **Colab `T4`** (16 GB, 65 TF) | Proxy `train.py` (11.5M) | Single-GPU `float16` + dynamic loss scaling | 101,000 tok/s | 8.85% |
 
 ```bash
-# Multi-session 1B pretraining on Kaggle TPU v5e-8 (syncs to private HF Hub repo):
-python -m scale.pretrain --preset 1b --dataset climbmix \
+# Multi-session 1B pretraining on Kaggle TPU v5e-8 (stable phase on mix-1b, syncs to private HF Hub repo):
+# Add `--matmul-quant int8` (or `int8-all`) & `--param-dtype bfloat16` for ~175K+ tok/s on v5e-8!
+python -m scale.pretrain --preset 1b --dataset mix-1b \
+    --remat-policy save_all_compute --splash-block-size 1024 \
     --sync-backend hf --remote-target <your-user>/my-1b-base \
     --phase stable --max-hours 8.5
 
-# Trigger final WSD cooldown decay once ready:
-python -m scale.pretrain --preset 1b --dataset climbmix \
+# Trigger final WSD cooldown decay on high-density mix-cooldown once ready (~16-18B tokens):
+python -m scale.pretrain --preset 1b --dataset mix-cooldown \
+    --remat-policy save_all_compute --splash-block-size 1024 \
     --sync-backend hf --remote-target <your-user>/my-1b-base \
     --phase decay --decay-steps 4000 --max-hours 8.5
 ```
 
 ## Running the Test Suite
 
-Run both the proxy autoresearch suite (19 tests) and the 8-device FSDP 1B pretraining & multi-session resume suite:
+Run both the proxy autoresearch suite (20 tests) and the 8-device FSDP 1B pretraining, multi-dataset mixer, BF16+SR, INT8/FP8 quantization & Fused Cut-Cross-Entropy suite (15 tests):
 
 ```bash
 pytest -v tests/

@@ -34,13 +34,24 @@ class ModelSpec:
     rope_base: float = 10000.0
     softcap: float = 15.0            # 0.0 disables logit softcapping
     z_loss_weight: float = 1e-4      # Auxiliary router/logit stability loss (0.0 disables)
-    use_remat: bool = True           # Gradient checkpointing per scanned layer
+    use_remat: bool = True           # Legacy bool (overridden when remat_policy != "auto")
+    remat_policy: str = "save_attn"  # "none" | "save_all_compute" | "save_attn" | "save_qkv_attn" | "dots_with_no_batch_dims" | "dots" | "full"
+    attn_impl: str = "auto"          # "auto" (Splash on TPU, cuDNN on Ampere+ GPU, XLA fallback) | "splash" | "cudnn" | "xla"
+    loss_chunk_size: int = 2048      # Chunked linear CE token count (0 disables; 2048 cuts logits HBM by ~8-16x!)
+    splash_block_size: int = 1024    # TPU Pallas SplashAttention VMEM tile size (auto-clamped to seq_len)
+    matmul_quant: str = "none"       # Experimental linear GEMM quant: "none" | "int8" | "int8-all" | "fp8"
+    scan_unroll: int = 1             # jax.lax.scan layer unroll factor (1 or 2 for pipeline overlap)
 
     def __post_init__(self) -> None:
         assert self.n_embd % self.n_head == 0, f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"
         assert self.n_head % self.n_kv_head == 0, f"n_head ({self.n_head}) must be divisible by n_kv_head ({self.n_kv_head})"
         assert self.activation in ("swiglu", "relu2", "gelu"), f"Unsupported activation: {self.activation!r}"
         assert all(c in "SL" for c in self.window_pattern.upper()), f"Invalid window_pattern: {self.window_pattern!r}"
+        valid_remat = ("none", "save_all_compute", "save_attn", "save_qkv_attn", "dots_with_no_batch_dims", "dots", "full")
+        assert self.remat_policy in valid_remat, f"Invalid remat_policy: {self.remat_policy!r}"
+        assert self.attn_impl in ("auto", "splash", "cudnn", "xla"), f"Invalid attn_impl: {self.attn_impl!r}"
+        assert self.matmul_quant in ("none", "int8", "int8-all", "fp8"), f"Invalid matmul_quant: {self.matmul_quant!r}"
+        assert self.scan_unroll >= 1, f"scan_unroll must be >= 1, got {self.scan_unroll}"
 
     @property
     def head_dim(self) -> int:
@@ -84,7 +95,8 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         activation="swiglu",
         window_pattern="SL",
         use_value_embeds=False,
-        use_remat=True,
+        remat_policy="save_attn",
+        loss_chunk_size=128,
     ),
     # ~126M proxy model (fast validation on Colab T4 / TPU v5e-1)
     "100m": ModelSpec(
@@ -98,7 +110,8 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         activation="swiglu",
         window_pattern="L",
         use_value_embeds=False,
-        use_remat=True,
+        remat_policy="save_attn",
+        loss_chunk_size=2048,
     ),
     # ~367M mid-scale model (great for 1-session Colab A100 / v6e-1 sanity runs)
     "350m": ModelSpec(
@@ -112,9 +125,10 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         activation="swiglu",
         window_pattern="L",
         use_value_embeds=False,
-        use_remat=True,
+        remat_policy="save_attn",
+        loss_chunk_size=2048,
     ),
-    # ~1.036B flagship base model (optimal for Kaggle TPU v5e-8 FSDP & Colab v6e-1/H100)
+    # ~1.036B flagship base model (optimal for Kaggle TPU v5e-8 FSDP & Colab G4/A100/H100/v6e-1)
     "1b": ModelSpec(
         sequence_len=2048,
         vocab_size=32768,
@@ -126,9 +140,10 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         activation="swiglu",
         window_pattern="L",
         use_value_embeds=False,
-        use_remat=True,
+        remat_policy="save_attn",
+        loss_chunk_size=2048,
     ),
-    # ~1.015B ReLU^2 + Value-Embedding nanochat-style variant
+    # ~1.015B ReLU^2 + sliding-window nanochat-style variant
     "1b-relu2": ModelSpec(
         sequence_len=2048,
         vocab_size=32768,
@@ -140,7 +155,8 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         activation="relu2",
         window_pattern="SL",
         use_value_embeds=False,
-        use_remat=True,
+        remat_policy="save_attn",
+        loss_chunk_size=2048,
     ),
 }
 
@@ -159,8 +175,8 @@ def get_model_preset(name: str, arch_overrides: Optional[dict] = None) -> ModelS
 class TrainConfig:
     """Resumable WSD pretraining & FSDP runtime configuration."""
 
-    # Data
-    dataset: str = "climbmix"         # "climbmix" | "tinystories" | "synthetic"
+    # Data (single source, preset like "mix-1b" / "mix-cooldown" / "mix-code", or inline "src:w,...")
+    dataset: str = "climbmix"
     total_tokens: int = 20_000_000_000  # 20B tokens (Chinchilla-optimal for 1B)
     eval_tokens: int = 4 * 524_288    # ~2.1M pinned val tokens per eval
     shard_cache_dir: str = "/tmp/autoresearch_shards"
@@ -170,6 +186,7 @@ class TrainConfig:
     total_batch_size: int = 524_288   # 512K tokens/step (256 seqs @ 2048)
     per_device_batch: int = 4         # Microbatch sequences per chip (4 x 8 chips = 32 seqs)
     compute_dtype: str = "auto"       # "auto" | "bfloat16" | "float16" | "float32"
+    param_dtype: str = "float32"      # "float32" (standard) or "bfloat16" (pure BF16 + stochastic rounding!)
     opt_dtype: str = "float32"        # "float32" (standard) or "bfloat16" (saves 50% opt HBM)
     use_fsdp: bool = True             # Shard params + opt_state across all devices
 
@@ -183,6 +200,7 @@ class TrainConfig:
     adam_beta2: float = 0.95
     muon_beta2: float = 0.95
     muon_ns_steps: int = 5
+    muon_vmap: bool = False           # False = low-HBM lax.scan; True = batched vmap (great on v5e-8 / G4!)
     grad_clip: float = 1.0
 
     # WSD (Warmup -> Stable -> Decay) schedule for seamless multi-session pretraining!
