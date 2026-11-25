@@ -182,18 +182,27 @@ def _causal_attention(
     k: jax.Array,
     v: jax.Array,
     window_size: Optional[tuple[int, int]],
+    mesh: Optional[Mesh] = None,
 ) -> jax.Array:
     """
     Unified causal (optionally sliding-window) dot-product attention for GPU, TPU, and CPU.
-    Input/output layout: (B, T, N, H). Supports MHA and GQA natively.
+    Auto-dispatches to Pallas SplashAttention on TPU, cuDNN FlashAttention on Ampere+/Blackwell
+    GPUs, and XLA dot_product_attention on T4/P100/CPU. Input/output layout: (B, T, N, H).
     """
-    return jax.nn.dot_product_attention(
-        q,
-        k,
-        v,
-        is_causal=True,
-        local_window_size=window_size,
-    )
+    try:
+        from scale.attention import fused_causal_attention
+
+        return fused_causal_attention(
+            q, k, v, window_size=window_size, backend="auto", splash_block_size=1024, mesh=mesh
+        )
+    except Exception:
+        return jax.nn.dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+            local_window_size=window_size,
+        )
 
 
 def apply_block(
@@ -205,6 +214,7 @@ def apply_block(
     config: GPTConfig,
     window_size: Optional[tuple[int, int]],
     compute_dtype,
+    mesh: Optional[Mesh] = None,
 ) -> jax.Array:
     B, T, C = x.shape
     head_dim = C // config.n_head
@@ -224,7 +234,7 @@ def apply_block(
     q = rms_norm(apply_rotary_emb(q, cos, sin))
     k = rms_norm(apply_rotary_emb(k, cos, sin))
 
-    y = _causal_attention(q, k, v, window_size)
+    y = _causal_attention(q, k, v, window_size, mesh=mesh)
     y = y.reshape(B, T, C)
     x = x + jnp.dot(y, block["c_proj"].astype(compute_dtype))
 
@@ -245,6 +255,7 @@ def gpt_forward_loss_2d(
     config: GPTConfig,
     window_sizes: tuple[Optional[tuple[int, int]], ...],
     compute_dtype,
+    mesh: Optional[Mesh] = None,
 ) -> jax.Array:
     """Return per-token cross-entropy losses in nats of shape (B, T) in float32."""
     T = idx.shape[1]
@@ -255,17 +266,17 @@ def gpt_forward_loss_2d(
     x = rms_norm(x)
     x0 = x
 
-    block_runner = jax.checkpoint(apply_block, static_argnums=(5, 6, 7)) if config.use_remat else apply_block
+    block_runner = jax.checkpoint(apply_block, static_argnums=(5, 6, 7, 8)) if config.use_remat else apply_block
 
     for i in range(config.n_layer):
         r_lam = params["resid_lambdas"][i].astype(compute_dtype)
         x0_lam = params["x0_lambdas"][i].astype(compute_dtype)
         x = r_lam * x + x0_lam * x0
         ve = params["value_embeds"][str(i)][idx] if str(i) in params["value_embeds"] else None
-        x = block_runner(params["blocks"][i], x, ve, cos_t, sin_t, config, window_sizes[i], compute_dtype)
+        x = block_runner(params["blocks"][i], x, ve, cos_t, sin_t, config, window_sizes[i], compute_dtype, mesh)
 
     x = rms_norm(x)
-    logits = jnp.dot(x, params["lm_head"].astype(compute_dtype)).astype(jnp.float32)
+    logits = jnp.dot(x, params["lm_head"].astype(compute_dtype), preferred_element_type=jnp.float32)
     logits = config.softcap * jnp.tanh(logits / config.softcap)
 
     log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -596,7 +607,7 @@ def main() -> None:
 
     # 5. Fused JIT-Compiled Training Step (lax.scan over micro-steps + SPMD all-reduce + MuonAdamW)
     def micro_loss(p, x, y, scale):
-        nll = gpt_forward_loss_2d(p, x, y, cos, sin, config, window_sizes, compute_dtype)
+        nll = gpt_forward_loss_2d(p, x, y, cos, sin, config, window_sizes, compute_dtype, mesh=mesh)
         loss = jnp.mean(nll, dtype=jnp.float32)
         return loss * scale, loss
 
@@ -751,7 +762,7 @@ def main() -> None:
 
     # 7. Final Validation Evaluation (immutable evaluate_bpb from prepare.py)
     def eval_loss_fn(p, x, y):
-        return gpt_forward_loss_2d(p, x, y, cos, sin, config, window_sizes, compute_dtype)
+        return gpt_forward_loss_2d(p, x, y, cos, sin, config, window_sizes, compute_dtype, mesh=mesh)
 
     val_bpb = evaluate_bpb(
         eval_loss_fn,

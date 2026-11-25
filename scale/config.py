@@ -38,7 +38,7 @@ class ModelSpec:
     remat_policy: str = "save_attn"  # "none" | "save_all_compute" | "save_attn" | "save_qkv_attn" | "dots_with_no_batch_dims" | "dots" | "full"
     attn_impl: str = "auto"          # "auto" (Splash on TPU, cuDNN on Ampere+ GPU, XLA fallback) | "splash" | "cudnn" | "xla"
     loss_chunk_size: int = 2048      # Chunked linear CE token count (0 disables; 2048 cuts logits HBM by ~8-16x!)
-    splash_block_size: int = 512     # TPU Pallas SplashAttention VMEM tile size (128/256/512)
+    splash_block_size: int = 1024    # TPU Pallas SplashAttention VMEM tile size (auto-clamped to seq_len)
 
     def __post_init__(self) -> None:
         assert self.n_embd % self.n_head == 0, f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"

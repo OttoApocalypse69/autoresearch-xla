@@ -393,6 +393,130 @@ def _chunk_ce_and_z(x_chunk: jax.Array, y_chunk: jax.Array, lm_w: jax.Array, sof
     return nll, z_loss
 
 
+def _make_fused_chunked_loss_fn(softcap: float, z_loss_weight: float):
+    """
+    Single-pass Cut-Cross-Entropy in pure JAX (`@jax.custom_vjp`).
+
+    Operates on FSDP-aligned chunks `(n_chunks, global_chunk_tok, C)` and `(n_chunks, global_chunk_tok)`
+    so on multi-chip TPU/GPU (e.g. Kaggle v5e-8) each chip processes its own local chunk in parallel
+    with zero cross-chip resharding. Computes `(scaled_total, mean_ce, mean_z)` AND exact gradients
+    `(d_x_chunks, d_lm_w)` in ONE chunked scan — 0% `lm_head` recomputation (3x matmuls instead of 4x)
+    while keeping peak logits HBM bounded to a single chunk (~268 MB vs 4.3 GB!).
+    """
+    def _chunk_total(xc, w, yc, chunk_scale):
+        nll_c, z_c = _chunk_ce_and_z(xc, yc, w, softcap)
+        ce_c = jnp.mean(nll_c, dtype=jnp.float32)
+        tot_c = (ce_c + jnp.float32(z_loss_weight) * z_c) * chunk_scale
+        return tot_c, (ce_c, z_c)
+
+    chunk_val_and_grad = jax.value_and_grad(_chunk_total, argnums=(0, 1), has_aux=True)
+
+    @jax.custom_vjp
+    def _fused_loss(x_ch: jax.Array, lm_w: jax.Array, y_ch: jax.Array, scale: jax.Array):
+        n_chunks = x_ch.shape[0]
+        inv_n = jnp.float32(1.0 / n_chunks)
+
+        def fwd_only_body(carry, pair):
+            ce_acc, z_acc = carry
+            xc, yc = pair
+            nll_c, z_c = _chunk_ce_and_z(xc, yc, lm_w, softcap)
+            return (ce_acc + jnp.mean(nll_c, dtype=jnp.float32), z_acc + z_c), None
+
+        (ce_sum, z_sum), _ = jax.lax.scan(
+            fwd_only_body, (jnp.float32(0.0), jnp.float32(0.0)), (x_ch, y_ch)
+        )
+        ce = ce_sum * inv_n
+        z = z_sum * inv_n
+        tot = (ce + jnp.float32(z_loss_weight) * z) * scale
+        return tot, ce, z
+
+    def _fused_fwd(x_ch: jax.Array, lm_w: jax.Array, y_ch: jax.Array, scale: jax.Array):
+        n_chunks = x_ch.shape[0]
+        inv_n = jnp.float32(1.0 / n_chunks)
+        chunk_scale = scale * inv_n
+        # Accumulate lm_head grad in fp32 for fp16/fp32, or lm_w.dtype (bf16) when weights are bf16
+        dw_acc_dtype = jnp.float32 if lm_w.dtype == jnp.float16 else lm_w.dtype
+        dw_init = jnp.zeros_like(lm_w, dtype=dw_acc_dtype)
+
+        def scan_body(carry, pair):
+            tot_acc, ce_acc, z_acc, dw_acc = carry
+            xc, yc = pair
+            (tot_c, (ce_c, z_c)), (dx_c, dw_c) = chunk_val_and_grad(xc, lm_w, yc, chunk_scale)
+            dw_acc = dw_acc + dw_c.astype(dw_acc_dtype)
+            return (tot_acc + tot_c, ce_acc + ce_c, z_acc + z_c, dw_acc), dx_c
+
+        (tot_sum, ce_sum, z_sum, dw_sum), dx_chunks = jax.lax.scan(
+            scan_body,
+            (jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0), dw_init),
+            (x_ch, y_ch),
+        )
+        ce = ce_sum * inv_n
+        z = z_sum * inv_n
+        return (tot_sum, ce, z), (dx_chunks, dw_sum.astype(lm_w.dtype))
+
+    def _fused_bwd(res, g_out):
+        dx_chunks, d_lm_w = res
+        g_tot, _, _ = g_out
+        return (
+            dx_chunks * g_tot.astype(dx_chunks.dtype),
+            d_lm_w * g_tot.astype(d_lm_w.dtype),
+            None,
+            None,
+        )
+
+    _fused_loss.defvjp(_fused_fwd, _fused_bwd)
+    return _fused_loss
+
+
+def _pack_fsdp_chunks(x: jax.Array, targets: jax.Array, chunk_sz: int, mesh: Optional[Mesh]):
+    """
+    Pack `(B, T, C)` and `(B, T)` into `(n_chunks, n_dev * chunk_sz, C)` so every FSDP chip
+    processes `chunk_sz` local tokens per scan step with zero cross-chip resharding.
+    Returns `(x_chunks, y_chunks, n_dev, n_chunks)` or `None` if chunking does not apply.
+    """
+    B, T, C = x.shape
+    n_dev = mesh.size if (mesh is not None and mesh.size > 1 and B % mesh.size == 0) else 1
+    local_tok = (B // n_dev) * T
+    if chunk_sz <= 0 or local_tok <= chunk_sz or local_tok % chunk_sz != 0:
+        return None
+    n_chunks = local_tok // chunk_sz
+    x_4d = x.reshape(n_dev, n_chunks, chunk_sz, C).transpose(1, 0, 2, 3)
+    y_3d = targets.reshape(n_dev, n_chunks, chunk_sz).transpose(1, 0, 2)
+    return x_4d.reshape(n_chunks, n_dev * chunk_sz, C), y_3d.reshape(n_chunks, n_dev * chunk_sz), n_dev, n_chunks
+
+
+def forward_scalar_loss_and_z(
+    params: dict,
+    idx: jax.Array,
+    targets: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
+    spec: ModelSpec,
+    compute_dtype,
+    scale: jax.Array,
+    mesh: Optional[Mesh] = None,
+):
+    """
+    Training loss entry point returning `(scaled_total_loss, mean_ce, mean_z)`.
+    Uses single-pass fused Cut-Cross-Entropy when chunking applies (0% lm_head recompute,
+    ~16x lower logits HBM, and zero cross-chip resharding on multi-chip FSDP!).
+    """
+    x = forward_hidden(params, idx, cos, sin, spec, compute_dtype, mesh=mesh)
+    lm_w = params["wte"].T.astype(compute_dtype) if spec.tie_embeddings else params["lm_head"].astype(compute_dtype)
+
+    packed = _pack_fsdp_chunks(x, targets, spec.loss_chunk_size, mesh)
+    if packed is not None:
+        x_chunks, y_chunks, _, _ = packed
+        fused_fn = _make_fused_chunked_loss_fn(spec.softcap, spec.z_loss_weight)
+        return fused_fn(x_chunks, lm_w, y_chunks, scale)
+
+    B, T, C = x.shape
+    nll, z_loss = _chunk_ce_and_z(x.reshape(B * T, C), targets.reshape(B * T), lm_w, spec.softcap)
+    ce = jnp.mean(nll, dtype=jnp.float32)
+    tot = (ce + jnp.float32(spec.z_loss_weight) * z_loss) * scale
+    return tot, ce, z_loss
+
+
 def forward_loss_2d(
     params: dict,
     idx: jax.Array,
@@ -406,20 +530,17 @@ def forward_loss_2d(
 ):
     """
     Return exact per-token NLL `(B, T)` in float32 (plus optional mean z-loss).
-    Automatically uses checkpointed chunked linear cross-entropy when `loss_chunk_size`
-    cleanly divides `B * T` to eliminate the giant `(B, T, vocab)` HBM spike!
+    Automatically uses FSDP-aligned chunked linear cross-entropy when `loss_chunk_size`
+    cleanly divides per-device tokens to eliminate the giant `(B, T, vocab)` HBM spike!
     """
     x = forward_hidden(params, idx, cos, sin, spec, compute_dtype, mesh=mesh)
     lm_w = params["wte"].T.astype(compute_dtype) if spec.tie_embeddings else params["lm_head"].astype(compute_dtype)
 
     B, T, C = x.shape
-    total_tok = B * T
-    chunk_sz = spec.loss_chunk_size
-
-    if chunk_sz > 0 and total_tok > chunk_sz and total_tok % chunk_sz == 0:
-        n_chunks = total_tok // chunk_sz
-        x_chunks = x.reshape(n_chunks, chunk_sz, C)
-        y_chunks = targets.reshape(n_chunks, chunk_sz)
+    packed = _pack_fsdp_chunks(x, targets, spec.loss_chunk_size, mesh)
+    if packed is not None:
+        x_chunks, y_chunks, n_dev, n_chunks = packed
+        chunk_sz = spec.loss_chunk_size
 
         chunk_fn = jax.checkpoint(
             functools.partial(_chunk_ce_and_z, softcap=spec.softcap),
@@ -432,12 +553,12 @@ def forward_loss_2d(
             return None, (nll_c, z_c)
 
         _, (nll_chunks, z_chunks) = jax.lax.scan(scan_chunk, None, (x_chunks, y_chunks))
-        nll = nll_chunks.reshape(B, T)
+        nll = nll_chunks.reshape(n_chunks, n_dev, chunk_sz).transpose(1, 0, 2).reshape(B, T)
         if return_z_loss:
             return nll, jnp.mean(z_chunks, dtype=jnp.float32)
         return nll
 
-    nll, z_loss = _chunk_ce_and_z(x.reshape(total_tok, C), targets.reshape(total_tok), lm_w, spec.softcap)
+    nll, z_loss = _chunk_ce_and_z(x.reshape(B * T, C), targets.reshape(B * T), lm_w, spec.softcap)
     nll = nll.reshape(B, T)
     if return_z_loss:
         return nll, z_loss

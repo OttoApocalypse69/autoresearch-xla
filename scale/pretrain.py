@@ -36,6 +36,9 @@ _DEFAULT_TPU_XLA_FLAGS = (
 )
 if not os.environ.get("LIBTPU_INIT_ARGS"):
     os.environ["LIBTPU_INIT_ARGS"] = _DEFAULT_TPU_XLA_FLAGS
+if os.path.exists("/dev/nvidia0") and not os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION"):
+    # JAX defaults to 75% GPU VRAM; unlock 90% so larger microbatches & 1B models fit comfortably
+    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
 
 import argparse
 import functools
@@ -67,6 +70,7 @@ from scale.model import (
     count_params,
     estimate_flops_per_token,
     forward_loss_2d,
+    forward_scalar_loss_and_z,
     generate_tokens,
     init_params,
     precompute_rotary_embeddings,
@@ -116,12 +120,10 @@ def _build_train_step(
     replicated,
 ):
     def micro_loss_fn(p, x, y, scale):
-        nll, z_loss = forward_loss_2d(
-            p, x, y, cos, sin, spec, compute_dtype, return_z_loss=True, mesh=mesh
+        total_scaled, ce, z_loss = forward_scalar_loss_and_z(
+            p, x, y, cos, sin, spec, compute_dtype, scale=scale, mesh=mesh
         )
-        ce = jnp.mean(nll, dtype=jnp.float32)
-        total = ce + jnp.float32(spec.z_loss_weight) * z_loss
-        return total * scale, (ce, z_loss)
+        return total_scaled, (ce, z_loss)
 
     grad_fn = jax.value_and_grad(micro_loss_fn, has_aux=True)
 
@@ -458,6 +460,8 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
 
     try:
         x_np, y_np, cur = next(loader)
+        x_dev = jax.device_put(x_np, step_sharding)
+        y_dev = jax.device_put(y_np, step_sharding)
         while not stop_requested["flag"]:
             if tcfg.max_steps is not None and session_steps >= tcfg.max_steps:
                 print(f"\n[Scale] Reached max_steps={tcfg.max_steps} for this session.")
@@ -472,9 +476,6 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
             if tcfg.max_hours is not None and (time.time() - t_session_start) / 3600.0 >= tcfg.max_hours:
                 print(f"\n[Scale] Reached max_hours={tcfg.max_hours:.2f}h safety limit.")
                 break
-
-            x_dev = jax.device_put(x_np, step_sharding)
-            y_dev = jax.device_put(y_np, step_sharding)
 
             lrm = compute_wsd_lrm(step, tcfg)
             muon_mom = compute_muon_momentum(step)
@@ -491,8 +492,10 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
                 jax.device_put(jnp.float32(loss_scale), replicated),
             )
 
-            # Prefetch next host batch immediately while TPU/GPU runs asynchronously!
+            # Overlap next host batch fetch + async H2D DMA with current TPU/GPU compute!
             x_np, y_np, cur = next(loader)
+            x_dev = jax.device_put(x_np, step_sharding)
+            y_dev = jax.device_put(y_np, step_sharding)
 
             step += 1
             session_steps += 1

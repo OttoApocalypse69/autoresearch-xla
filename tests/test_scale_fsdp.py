@@ -296,3 +296,49 @@ def test_chunked_ce_matches_full_ce():
     nll_c, z_c = forward_loss_2d(params, x, y, cos, sin, spec_chunk, jnp.float32, return_z_loss=True)
     assert float(jnp.max(jnp.abs(nll_f - nll_c))) < 1e-5
     assert abs(float(z_f) - float(z_c)) < 1e-5
+
+
+def test_fused_chunked_ce_exact_gradients_and_remat_policies():
+    import jax
+    import jax.numpy as jnp
+    from scale.model import (
+        forward_loss_2d,
+        forward_scalar_loss_and_z,
+        init_params,
+        precompute_rotary_embeddings,
+    )
+
+    spec_full = ModelSpec(
+        sequence_len=32, vocab_size=128, n_layer=2, n_embd=64, n_head=2, n_kv_head=1,
+        mlp_hidden=128, activation="swiglu", loss_chunk_size=0, remat_policy="none",
+    )
+    spec_fused = ModelSpec.from_dict({**spec_full.to_dict(), "loss_chunk_size": 16, "remat_policy": "save_all_compute"})
+    params = init_params(jax.random.PRNGKey(1), spec_full)
+    cos, sin = precompute_rotary_embeddings(32, 32)
+    rng = np.random.default_rng(9)
+    x = jnp.asarray(rng.integers(0, 128, size=(2, 32), dtype=np.int32))
+    y = jnp.asarray(rng.integers(0, 128, size=(2, 32), dtype=np.int32))
+
+    for dtype, scale_val, tol in [(jnp.float32, 1.0, 1e-5), (jnp.bfloat16, 1.0, 2e-3), (jnp.float16, 1024.0, 2e-3)]:
+        scale = jnp.float32(scale_val)
+        p_in = jax.tree_util.tree_map(lambda a: a.astype(dtype), params)
+
+        def ref_fn(p):
+            nll, z = forward_loss_2d(p, x, y, cos, sin, spec_full, dtype, return_z_loss=True)
+            ce = jnp.mean(nll, dtype=jnp.float32)
+            return (ce + jnp.float32(spec_full.z_loss_weight) * z) * scale, (ce, z)
+
+        def fused_fn(p):
+            tot, ce, z = forward_scalar_loss_and_z(p, x, y, cos, sin, spec_fused, dtype, scale=scale)
+            return tot, (ce, z)
+
+        (_, (ce_r, z_r)), g_r = jax.value_and_grad(ref_fn, has_aux=True)(p_in)
+        (_, (ce_f, z_f)), g_f = jax.value_and_grad(fused_fn, has_aux=True)(p_in)
+        assert abs(float(ce_r) - float(ce_f)) < 1e-3
+        assert abs(float(z_r) - float(z_f)) < 1e-3
+        max_unscaled_diff = max(
+            float(jnp.max(jnp.abs(a.astype(jnp.float32) - b.astype(jnp.float32)))) / scale_val
+            for a, b in zip(jax.tree_util.tree_leaves(g_r), jax.tree_util.tree_leaves(g_f))
+        )
+        assert max_unscaled_diff < tol, f"Grad mismatch for {dtype}: {max_unscaled_diff}"
+

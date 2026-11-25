@@ -119,7 +119,8 @@ def _splash_attention_tpu(
         return jax.vmap(kernel)(ql, kl, vl)
 
     if mesh is not None and mesh.size > 1:
-        spec = P("fsdp", None, None, None)
+        axis_name = mesh.axis_names[0]
+        spec = P(axis_name, None, None, None)
         out_bhtd = _SHARD_MAP(
             local_fn,
             mesh=mesh,
