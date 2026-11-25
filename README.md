@@ -35,13 +35,14 @@ Out of the box (`DEPTH = None`, `TOTAL_BATCH_SIZE = None`), `train.py` detects y
 | `TPU v5e-8` | Kaggle (Free) | 8 TPU | `bfloat16` | ~1,576 | 8 | 524,288 | Off |
 | `TPU v6e-1` | Colab Pro | 1 TPU | `bfloat16` | ~918 | 8 | 524,288 | Off |
 | `H100` | Colab Pro+ | 1 GPU | `bfloat16` | ~989 | 8 | 524,288 | Off |
+| `RTX PRO 6000 (G4)` | Colab Pro+ | 1 GPU (96 GB) | `bfloat16` | ~504 | 8 | 524,288 | Off |
 | `TPU v3-8` | Kaggle (Free) | 8 TPU | `bfloat16` | ~492 | 8 | 262,144 | On |
 | `A100` | Colab Pro | 1 GPU | `bfloat16` | ~312 | 8 | 262,144 | Off |
-| `TPU v5e-1` | Colab (Free) | 1 TPU | `bfloat16` | ~197 | 6 | 131,072 | On |
+| `TPU v5e-1` | Colab (Free) | 1 TPU | `bfloat16` | ~197 | 6 | 131,072 | Off |
 | `TPU v2-8` | Colab (Free) | 8 TPU | `bfloat16` | ~180 | 6 | 131,072 | On |
-| `2× T4` | Kaggle (Free) | 2 GPU | `float16` | ~130 | 6 | 65,536 | On |
+| `2× T4` | Kaggle (Free) | 2 GPU | `float16` | ~130 | 6 | 65,536 | Off |
 | `L4` | Colab Pro | 1 GPU | `bfloat16` | ~121 | 6 | 131,072 | On |
-| `T4` / `P100` | Colab / Kaggle | 1 GPU | `float16` | ~65 / 21 | 4 | 32,768 | On |
+| `T4` / `P100` | Colab / Kaggle | 1 GPU | `float16` | ~65 / 21 | 4 | 32,768 | Off / On |
 | `CPU` | Local / CI | N CPU | `float32` | ~0.5/core | 2 | 1,024+ | Off |
 
 ## Quickstart
@@ -49,7 +50,7 @@ Out of the box (`DEPTH = None`, `TOTAL_BATCH_SIZE = None`), `train.py` detects y
 ### Option 1: Google Colab or Kaggle Notebook (Recommended)
 
 1. Open `autoresearch_colab_kaggle.ipynb` in Google Colab or Kaggle Notebooks.
-2. Select any **GPU** or **TPU** runtime (`T4`, `2×T4`, `L4`, `A100`, `TPU v5e-1`, `TPU v5e-8`, etc.).
+2. Select any **GPU** or **TPU** runtime (`T4`, `2×T4`, `L4`, `A100`, `G4`, `TPU v5e-1`, `TPU v5e-8`, etc.).
 3. Add one API key to **Colab Secrets** or **Kaggle Secrets**:
    - `GEMINI_API_KEY` (Google AI Studio)
    - `ANTHROPIC_API_KEY` (Claude)
@@ -88,7 +89,7 @@ Run directly from your local terminal against remote Colab or Kaggle accelerator
 ```bash
 # Google Colab CLI (https://github.com/googlecolab/google-colab-cli)
 uv tool install google-colab-cli
-colab new -s autoresearch --tpu v5e1   # or --gpu T4 / L4 / A100 / H100
+colab new -s autoresearch --tpu v5e1   # or --gpu T4 / L4 / A100 / H100 / G4
 colab exec -s autoresearch -f autoresearch_colab_kaggle.ipynb
 colab stop -s autoresearch             # always release the VM when finished
 
@@ -101,28 +102,49 @@ kaggle kernels push -p . --accelerator TpuV5E8   # or NvidiaTeslaT4 (2xT4 GPU)
 
 ## Scaling Up to 1B+ Parameters (`scale/`)
 
-Once `autoresearch-xla` discovers a strong architecture/optimizer recipe at proxy scale, scale it up with the resumable multi-chip **1D FSDP pretraining engine** ([`scale/pretrain.py`](scale/pretrain.py) & [`pretrain_1b_colab_kaggle.ipynb`](pretrain_1b_colab_kaggle.ipynb)):
+Once `autoresearch-xla` discovers a strong architecture/optimizer recipe at proxy scale, scale it up with the high-MFU resumable multi-chip **1D FSDP pretraining engine** ([`scale/pretrain.py`](scale/pretrain.py) & [`pretrain_1b_colab_kaggle.ipynb`](pretrain_1b_colab_kaggle.ipynb)):
 
-- **True 1D FSDP across 8 TPU chips / multi-GPU**: Shards 1.036B weights + NorMuon/AdamW states across 8 chips on Kaggle TPU `v5e-8` (**~1.15 GB/chip** static HBM out of 16 GB/chip) and uses `jax.lax.scan` over layers + per-layer `jax.checkpoint` for ~20s compile times.
+- **True 1D FSDP across 8 TPU chips / multi-GPU**: Shards 1.036B weights + NorMuon/AdamW states across 8 chips on Kaggle TPU `v5e-8` (**~1.05 GB/chip** static HBM out of 16 GB/chip) — or even trains **1.036B on a single 16 GB Colab TPU `v5e-1` at 62.79% MFU**!
+- **Full MFU Engineering Stack**:
+  - Fused `w_qkv` & SwiGLU `w_gate_up` projections (all dims 128-aligned for TPU MXU / NVIDIA Tensor Cores)
+  - Auto-dispatched **Pallas TPU `SplashAttention(1024)`** (fused backward kernel + `shard_map` FSDP) & **GPU `cuDNN FlashAttention`** (also wired into proxy `train.py`!)
+  - **Flash/Splash-aware split rematerialization**: `save_all_compute` (0% GEMM & 0% Attention recompute, ~3× lower HBM than `none` by discarding redundant `silu`/`rms_norm` buffers) and `save_attn` (0% Attention/QKV recompute, ~7.5× lower HBM)
+  - **Single-pass FSDP Fused Cut-Cross-Entropy** (`@jax.custom_vjp`): 0% `lm_head` backward recomputation, zero cross-chip resharding, and ~16× lower logits HBM (`~268 MB` vs `4.3 GB`)
+  - Single `fp32 → bf16` weight staging (2× faster FSDP AllGather/ReduceScatter + halved micro-grad buffers), official MaxText `LIBTPU_INIT_ARGS`, 90% GPU VRAM preallocation, and async H2D double-buffering
 - **Disk-bounded ClimbMix streaming**: Streams shards from `karpathy/climbmix-400b-shuffle` using a rolling ~200 MB `/tmp` cache + exact resumable `DataCursor` (never fills Kaggle's 20 GB disk).
-- **WSD (Warmup → Stable → Decay)**: Train across unlimited 9h Kaggle / 12h Colab sessions in `--phase stable`, then run `--phase decay` for the final ~10% cooldown tokens.
-- **Topology-agnostic checkpoints**: Syncs weights (`safetensors`/`npz`), optimizer state, tokenizer, and shard cursor to **HuggingFace Hub** (`--sync-backend hf`), **Google Drive** (`--sync-backend local`), or **Kaggle Datasets** (`--sync-backend kaggle`) — seamlessly hop between Kaggle TPU `v5e-8` and Colab `v6e-1`/`H100` across sessions!
+- **WSD (Warmup → Stable → Decay)** + **Topology-agnostic checkpoints**: Syncs weights (`safetensors`/`npz`), optimizer state, tokenizer, and shard cursor to **HuggingFace Hub** (`--sync-backend hf`), **Google Drive** (`--sync-backend local`), or **Kaggle Datasets** (`--sync-backend kaggle`).
+
+### Verified Live MFU Benchmarks (Real Colab & Kaggle Hardware)
+
+| Hardware | Model / Engine | Configuration | Throughput | MFU |
+|---|---|---|---:|---:|
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | Proxy `train.py` (depth=6) | Baseline (unfused XLA attention) | 226,200 tok/s | 13.81% |
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | Proxy `train.py` (depth=6) | **+ Pallas `SplashAttention(1024)`** | **694,000 tok/s** | **39.58%** (**3.07×**) |
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` `350M` (367M) | Baseline (`xla` + `full` remat + unchunked CE) | 23,296 tok/s | 29.02% |
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` `350M` (367M) | **`Splash(1024)` + `save_all_compute` + Fused Cut-CE (`b=4`)** | **48,059 tok/s** | **59.86%** (**2.06×**) |
+| **Colab TPU `v5e-1`** (16 GB, 197 TF) | `scale/` **`1B` (1.036B)** | **`Splash(1024)` + `save_attn` + Fused Cut-CE (`bf16 opt`, `b=2`, 512K batch)** | **18,138 tok/s** | **62.79%** |
+| **Colab GPU `L4`** (24 GB, 121 TF) | `scale/` `350M` (367M) | Baseline (`xla` + `full` remat + unchunked CE) | 6,196 tok/s | 12.56% |
+| **Colab GPU `L4`** (24 GB, 121 TF) | `scale/` `350M` (367M) | **`cuDNN FlashAttention` + `save_attn` + chunked CE (`b=8`)** | **10,885 tok/s** | **22.07%** (**1.76×**) |
+| **Kaggle `2× T4`** (32 GB, 130 TF) | Proxy `train.py` (26.3M) | Multi-GPU SPMD `float16` + dynamic loss scaling | 95,000 tok/s | 9.90% |
+| **Colab `T4`** (16 GB, 65 TF) | Proxy `train.py` (11.5M) | Single-GPU `float16` + dynamic loss scaling | 101,000 tok/s | 8.85% |
 
 ```bash
 # Multi-session 1B pretraining on Kaggle TPU v5e-8 (syncs to private HF Hub repo):
 python -m scale.pretrain --preset 1b --dataset climbmix \
+    --remat-policy save_all_compute --splash-block-size 1024 \
     --sync-backend hf --remote-target <your-user>/my-1b-base \
     --phase stable --max-hours 8.5
 
 # Trigger final WSD cooldown decay once ready:
 python -m scale.pretrain --preset 1b --dataset climbmix \
+    --remat-policy save_all_compute --splash-block-size 1024 \
     --sync-backend hf --remote-target <your-user>/my-1b-base \
     --phase decay --decay-steps 4000 --max-hours 8.5
 ```
 
 ## Running the Test Suite
 
-Run both the proxy autoresearch suite (19 tests) and the 8-device FSDP 1B pretraining & multi-session resume suite:
+Run both the proxy autoresearch suite (20 tests) and the 8-device FSDP 1B pretraining, Fused Cut-Cross-Entropy & multi-session resume suite (13 tests):
 
 ```bash
 pytest -v tests/
