@@ -1,8 +1,9 @@
 # autoresearch-xla
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/OttoApocalypse69/autoresearch-xla/blob/main/autoresearch_colab_kaggle.ipynb)
+[![Open Autoresearch in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/OttoApocalypse69/autoresearch-xla/blob/main/autoresearch_colab_kaggle.ipynb)
+[![Open 1B FSDP Pretraining in Colab](https://img.shields.io/badge/Colab-1B%20FSDP%20Pretraining-F9AB00?logo=googlecolab&logoColor=white)](https://colab.research.google.com/github/OttoApocalypse69/autoresearch-xla/blob/main/pretrain_1b_colab_kaggle.ipynb)
 
-A pure **JAX/XLA** port of [Andrej Karpathy's `autoresearch`](https://github.com/karpathy/autoresearch) engineered to run autonomous LLM pretraining research loops on **Google Colab** and **Kaggle** across **both GPUs and TPUs** — from a free single T4 GPU up to free 8-chip Kaggle TPU `v5e-8` pods and Colab `A100` / `H100` / `v6e-1` runtimes.
+A pure **JAX/XLA** port of [Andrej Karpathy's `autoresearch`](https://github.com/karpathy/autoresearch) — plus a resumable **1B+ FSDP pretraining engine** (`scale/`) — engineered for **Google Colab** and **Kaggle** across **both GPUs and TPUs**.
 
 ## How It Works
 
@@ -98,12 +99,33 @@ kaggle quota                           # inspect weekly free GPU & TPU quota
 kaggle kernels push -p . --accelerator TpuV5E8   # or NvidiaTeslaT4 (2xT4 GPU)
 ```
 
-## Running the Test Suite
+## Scaling Up to 1B+ Parameters (`scale/`)
 
-The test suite verifies data prep, tokenizer roundtrip & exact BPB math, `train.py` on both single-device and **4-device simulated SPMD** (`XLA_FLAGS=--xla_force_host_platform_device_count=4`), `float16` dynamic loss scaling, Muon+AdamW convergence, `agent.py` diff patching + full end-to-end git ratchet with a mock LLM, and notebook validity:
+Once `autoresearch-xla` discovers a strong architecture/optimizer recipe at proxy scale, scale it up with the resumable multi-chip **1D FSDP pretraining engine** ([`scale/pretrain.py`](scale/pretrain.py) & [`pretrain_1b_colab_kaggle.ipynb`](pretrain_1b_colab_kaggle.ipynb)):
+
+- **True 1D FSDP across 8 TPU chips / multi-GPU**: Shards 1.036B weights + NorMuon/AdamW states across 8 chips on Kaggle TPU `v5e-8` (**~1.15 GB/chip** static HBM out of 16 GB/chip) and uses `jax.lax.scan` over layers + per-layer `jax.checkpoint` for ~20s compile times.
+- **Disk-bounded ClimbMix streaming**: Streams shards from `karpathy/climbmix-400b-shuffle` using a rolling ~200 MB `/tmp` cache + exact resumable `DataCursor` (never fills Kaggle's 20 GB disk).
+- **WSD (Warmup → Stable → Decay)**: Train across unlimited 9h Kaggle / 12h Colab sessions in `--phase stable`, then run `--phase decay` for the final ~10% cooldown tokens.
+- **Topology-agnostic checkpoints**: Syncs weights (`safetensors`/`npz`), optimizer state, tokenizer, and shard cursor to **HuggingFace Hub** (`--sync-backend hf`), **Google Drive** (`--sync-backend local`), or **Kaggle Datasets** (`--sync-backend kaggle`) — seamlessly hop between Kaggle TPU `v5e-8` and Colab `v6e-1`/`H100` across sessions!
 
 ```bash
-pytest -v tests/test_suite.py
+# Multi-session 1B pretraining on Kaggle TPU v5e-8 (syncs to private HF Hub repo):
+python -m scale.pretrain --preset 1b --dataset climbmix \
+    --sync-backend hf --remote-target <your-user>/my-1b-base \
+    --phase stable --max-hours 8.5
+
+# Trigger final WSD cooldown decay once ready:
+python -m scale.pretrain --preset 1b --dataset climbmix \
+    --sync-backend hf --remote-target <your-user>/my-1b-base \
+    --phase decay --decay-steps 4000 --max-hours 8.5
+```
+
+## Running the Test Suite
+
+Run both the proxy autoresearch suite (19 tests) and the 8-device FSDP 1B pretraining & multi-session resume suite:
+
+```bash
+pytest -v tests/
 ```
 
 ## License
