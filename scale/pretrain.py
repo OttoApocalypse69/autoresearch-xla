@@ -88,6 +88,7 @@ from scale.optimizer import (
     init_opt_state,
     optimizer_step,
 )
+from scale.quant import prequantize_model_weights
 
 os.makedirs(JAX_CACHE_DIR, exist_ok=True)
 jax.config.update("jax_compilation_cache_dir", JAX_CACHE_DIR)
@@ -125,13 +126,13 @@ def _build_train_step(
     step_sharding,
     replicated,
 ):
-    def micro_loss_fn(p, x, y, scale):
+    def micro_loss_fn(p, x, y, scale, q_cache):
         total_scaled, ce, z_loss = forward_scalar_loss_and_z(
-            p, x, y, cos, sin, spec, compute_dtype, scale=scale, mesh=mesh
+            p, x, y, cos, sin, spec, compute_dtype, scale=scale, mesh=mesh, q_cache=q_cache
         )
         return total_scaled, (ce, z_loss)
 
-    grad_fn = jax.value_and_grad(micro_loss_fn, has_aux=True)
+    grad_fn = jax.value_and_grad(micro_loss_fn, argnums=0, has_aux=True)
 
     @functools.partial(
         jax.jit,
@@ -159,8 +160,12 @@ def _build_train_step(
             p_work = p
         acc_dtype = jnp.bfloat16 if (tcfg.opt_dtype == "bfloat16" and use_bf16_w) else jnp.float32
 
+        # Pre-quantize all linear weights ONCE per optimizer step before grad_accum scan:
+        # eliminates 2*grad_accum redundant weight quantizations & halves weight HBM / FSDP AllGather!
+        q_cache = prequantize_model_weights(p_work, spec.matmul_quant, tie_embeddings=spec.tie_embeddings)
+
         if grad_accum_steps == 1:
-            (_, (mean_ce, mean_z)), g_raw = grad_fn(p_work, x_steps[0], y_steps[0], loss_scale)
+            (_, (mean_ce, mean_z)), g_raw = grad_fn(p_work, x_steps[0], y_steps[0], loss_scale, q_cache)
             grads = jax.tree_util.tree_map(lambda g: g / loss_scale, g_raw) if use_loss_scale else g_raw
         else:
             zero_grads = jax.tree_util.tree_map(lambda a: jnp.zeros_like(a, dtype=acc_dtype), p)
@@ -168,7 +173,7 @@ def _build_train_step(
             def accum_body(carry, batch):
                 g_acc, ce_acc, z_acc = carry
                 xb, yb = batch
-                (_, (ce_val, z_val)), g_micro = grad_fn(p_work, xb, yb, loss_scale)
+                (_, (ce_val, z_val)), g_micro = grad_fn(p_work, xb, yb, loss_scale, q_cache)
                 g_acc = jax.tree_util.tree_map(lambda a, b: a + b.astype(acc_dtype), g_acc, g_micro)
                 return (g_acc, ce_acc + ce_val, z_acc + z_val), None
 

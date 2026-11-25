@@ -515,3 +515,49 @@ assert diff_dq < 2e-2, f"Splash dq mismatch: {diff_dq}"
         text=True,
     )
     assert res.returncode == 0, f"8-dev SplashAttention test failed:\n{res.stdout}\n{res.stderr}"
+
+
+def test_prequantized_fsdp_int8_and_lm_head_bwd():
+    """Verify prequantized 1-byte weight cache, FSDP-local bf16 psum_scatter, and INT8 lm_head bwd on 8 devices."""
+    code = """
+import jax, jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
+from scale.config import TrainConfig, get_model_preset
+from scale.fsdp import create_fsdp_mesh
+from scale.model import _make_fused_chunked_loss_fn, _make_fused_chunked_loss_int8_bwd_fn
+from scale.pretrain import run_benchmark
+from scale.quant import quantize_int8
+
+mesh = create_fsdp_mesh()
+assert mesh.size == 8
+B_ch, M_ch, C, V = 2, 128, 64, 256
+x_ch = jax.device_put(jax.random.normal(jax.random.PRNGKey(0), (B_ch, M_ch, C), jnp.bfloat16) * 0.5, NamedSharding(mesh, P(None, "fsdp", None)))
+lm_w = jax.device_put(jax.random.normal(jax.random.PRNGKey(1), (C, V), jnp.bfloat16) * 0.2, NamedSharding(mesh, P(None, "fsdp")))
+y_ch = jax.device_put(jax.random.randint(jax.random.PRNGKey(2), (B_ch, M_ch), 0, V), NamedSharding(mesh, P(None, "fsdp")))
+lm_qb, lm_sb = quantize_int8(lm_w, axis=-1)
+sc = jax.device_put(jnp.float32(1.0), NamedSharding(mesh, P()))
+
+f_ex = _make_fused_chunked_loss_fn(15.0, 1e-4)
+f_i8 = _make_fused_chunked_loss_int8_bwd_fn(15.0, 1e-4, mesh)
+(_, (ce_e, _)), (dx_e, dw_e) = jax.jit(jax.value_and_grad(lambda x, w: (f_ex(x, w, y_ch, sc)[0], f_ex(x, w, y_ch, sc)[1:]), argnums=(0, 1), has_aux=True))(x_ch, lm_w)
+(_, (ce_q, _)), (dx_q, dw_q) = jax.jit(jax.value_and_grad(lambda x, w: (f_i8(x, w, lm_qb, lm_sb, y_ch, sc)[0], f_i8(x, w, lm_qb, lm_sb, y_ch, sc)[1:]), argnums=(0, 1), has_aux=True))(x_ch, lm_w)
+cos_dx = float(jnp.sum(dx_e.astype(jnp.float32) * dx_q.astype(jnp.float32)) / (jnp.linalg.norm(dx_e.astype(jnp.float32)) * jnp.linalg.norm(dx_q.astype(jnp.float32))))
+cos_dw = float(jnp.sum(dw_e.astype(jnp.float32) * dw_q.astype(jnp.float32)) / (jnp.linalg.norm(dw_e.astype(jnp.float32)) * jnp.linalg.norm(dw_q.astype(jnp.float32))))
+assert abs(float(ce_e) - float(ce_q)) < 1e-6
+assert cos_dx > 0.995 and cos_dw > 0.995, (cos_dx, cos_dw)
+
+for qmode in ("int8", "int8-all", "fp8"):
+    spec = get_model_preset("smoke", arch_overrides={"matmul_quant": qmode, "remat_policy": "save_all_compute", "loss_chunk_size": 128})
+    tcfg = TrainConfig(total_batch_size=2048, per_device_batch=1, param_dtype="bfloat16", opt_dtype="bfloat16", muon_vmap=True)
+    res = run_benchmark(spec, tcfg, warmup_steps=1, timed_steps=2)
+    assert res["tok_per_sec"] > 0
+"""
+    res = subprocess.run(
+        [PYTHON, "-c", code],
+        cwd=str(REPO_ROOT),
+        env={**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=8"},
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, f"8-dev prequant FSDP test failed:\n{res.stdout}\n{res.stderr}"
+

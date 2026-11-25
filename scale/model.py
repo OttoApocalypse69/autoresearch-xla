@@ -29,7 +29,12 @@ from jax.sharding import Mesh
 
 from scale.attention import fused_causal_attention, resolve_attn_backend
 from scale.config import ModelSpec
-from scale.quant import qdot
+from scale.quant import (
+    _dw_from_saved_xt_int8,
+    _quantize_x_for_dw_int8,
+    qdot,
+    quantize_int8,
+)
 
 
 def rms_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
@@ -132,6 +137,7 @@ def _get_checkpoint_policy(remat_policy: str):
 
 def _pre_attn_subblock(
     blk: dict,
+    q_blk: Optional[dict],
     resid_lam: jax.Array,
     x0_lam: jax.Array,
     x: jax.Array,
@@ -141,6 +147,7 @@ def _pre_attn_subblock(
     sin: jax.Array,
     spec: ModelSpec,
     compute_dtype,
+    mesh: Optional[Mesh] = None,
 ):
     B, T, C = x.shape
     head_dim = spec.head_dim
@@ -152,7 +159,8 @@ def _pre_attn_subblock(
         x = resid_lam.astype(compute_dtype) * x + x0_lam.astype(compute_dtype) * x0
 
     h = rms_norm(x)
-    qkv = qdot(h.reshape(B * T, C), blk["w_qkv"].astype(compute_dtype), mode=qmode)
+    qw_qkv = q_blk["w_qkv"] if (q_blk is not None and "w_qkv" in q_blk) else None
+    qkv = qdot(h.reshape(B * T, C), blk["w_qkv"].astype(compute_dtype), mode=qmode, q_weight=qw_qkv, mesh=mesh)
     qkv = checkpoint_name(qkv, "qkv")
     q = qkv[:, :C].reshape(B, T, spec.n_head, head_dim)
     k = qkv[:, C : C + kv_dim].reshape(B, T, spec.n_kv_head, head_dim)
@@ -173,6 +181,7 @@ def _pre_attn_subblock(
 
 def _post_attn_mlp_subblock(
     blk: dict,
+    q_blk: Optional[dict],
     resid_lam: jax.Array,
     x0_lam: jax.Array,
     x: jax.Array,
@@ -180,34 +189,41 @@ def _post_attn_mlp_subblock(
     y: jax.Array,
     spec: ModelSpec,
     compute_dtype,
+    mesh: Optional[Mesh] = None,
 ) -> jax.Array:
     B, T, C = x.shape
     qmode = spec.matmul_quant
     if spec.use_resid_lambdas:
         x = resid_lam.astype(compute_dtype) * x + x0_lam.astype(compute_dtype) * x0
 
-    y_out = qdot(y.reshape(B * T, C), blk["c_proj"].astype(compute_dtype), mode=qmode).reshape(B, T, C)
+    qw_out = q_blk["c_proj"] if (q_blk is not None and "c_proj" in q_blk) else None
+    y_out = qdot(y.reshape(B * T, C), blk["c_proj"].astype(compute_dtype), mode=qmode, q_weight=qw_out, mesh=mesh).reshape(B, T, C)
     y_out = checkpoint_name(y_out, "out_proj")
     x = x + y_out
 
     m = rms_norm(x).reshape(B * T, C)
     if spec.activation == "swiglu":
-        gu = checkpoint_name(qdot(m, blk["w_gate_up"].astype(compute_dtype), mode=qmode), "mlp_wi")
+        qw_gu = q_blk["w_gate_up"] if (q_blk is not None and "w_gate_up" in q_blk) else None
+        gu = checkpoint_name(qdot(m, blk["w_gate_up"].astype(compute_dtype), mode=qmode, q_weight=qw_gu, mesh=mesh), "mlp_wi")
         gate, up = jnp.split(gu, 2, axis=-1)
         m = jax.nn.silu(gate) * up
     elif spec.activation == "relu2":
-        fc = checkpoint_name(qdot(m, blk["mlp_fc"].astype(compute_dtype), mode=qmode), "mlp_wi")
+        qw_fc = q_blk["mlp_fc"] if (q_blk is not None and "mlp_fc" in q_blk) else None
+        fc = checkpoint_name(qdot(m, blk["mlp_fc"].astype(compute_dtype), mode=qmode, q_weight=qw_fc, mesh=mesh), "mlp_wi")
         m = jnp.square(jax.nn.relu(fc))
     else:  # "gelu"
-        fc = checkpoint_name(qdot(m, blk["mlp_fc"].astype(compute_dtype), mode=qmode), "mlp_wi")
+        qw_fc = q_blk["mlp_fc"] if (q_blk is not None and "mlp_fc" in q_blk) else None
+        fc = checkpoint_name(qdot(m, blk["mlp_fc"].astype(compute_dtype), mode=qmode, q_weight=qw_fc, mesh=mesh), "mlp_wi")
         m = jax.nn.gelu(fc, approximate=True)
 
-    mlp_out = qdot(m, blk["mlp_down"].astype(compute_dtype), mode=qmode).reshape(B, T, C)
+    qw_dn = q_blk["mlp_down"] if (q_blk is not None and "mlp_down" in q_blk) else None
+    mlp_out = qdot(m, blk["mlp_down"].astype(compute_dtype), mode=qmode, q_weight=qw_dn, mesh=mesh).reshape(B, T, C)
     return x + mlp_out
 
 
 def _apply_single_layer(
     blk: dict,
+    q_blk: Optional[dict],
     resid_lam: jax.Array,
     x0_lam: jax.Array,
     x: jax.Array,
@@ -220,7 +236,7 @@ def _apply_single_layer(
     compute_dtype,
     mesh: Optional[Mesh],
 ) -> jax.Array:
-    q, k, v = _pre_attn_subblock(blk, resid_lam, x0_lam, x, x0, ve_tok, cos, sin, spec, compute_dtype)
+    q, k, v = _pre_attn_subblock(blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, cos, sin, spec, compute_dtype, mesh=mesh)
     y = fused_causal_attention(
         q,
         k,
@@ -231,7 +247,7 @@ def _apply_single_layer(
         mesh=mesh,
     )
     y = checkpoint_name(y, "context")
-    return _post_attn_mlp_subblock(blk, resid_lam, x0_lam, x, x0, y, spec, compute_dtype)
+    return _post_attn_mlp_subblock(blk, q_blk, resid_lam, x0_lam, x, x0, y, spec, compute_dtype, mesh=mesh)
 
 
 def _make_layer_fn(
@@ -248,7 +264,7 @@ def _make_layer_fn(
     # while checkpointing pre-attn & post-attn/MLP discards giant silu & fp32 rms_norm buffers!
     if policy_name in ("save_all_compute", "save_attn") and attn_backend in ("splash", "cudnn"):
         pre_fn = jax.checkpoint(
-            functools.partial(_pre_attn_subblock, spec=spec, compute_dtype=compute_dtype),
+            functools.partial(_pre_attn_subblock, spec=spec, compute_dtype=compute_dtype, mesh=mesh),
             policy=_dots_or_named_policy("qkv"),
         )
         post_pol = (
@@ -257,12 +273,12 @@ def _make_layer_fn(
             else jax.checkpoint_policies.nothing_saveable
         )
         post_fn = jax.checkpoint(
-            functools.partial(_post_attn_mlp_subblock, spec=spec, compute_dtype=compute_dtype),
+            functools.partial(_post_attn_mlp_subblock, spec=spec, compute_dtype=compute_dtype, mesh=mesh),
             policy=post_pol,
         )
 
-        def split_layer(blk, resid_lam, x0_lam, x, x0, ve_tok, cos, sin):
-            q, k, v = pre_fn(blk, resid_lam, x0_lam, x, x0, ve_tok, cos, sin)
+        def split_layer(blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, cos, sin):
+            q, k, v = pre_fn(blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, cos, sin)
             y = fused_causal_attention(
                 q,
                 k,
@@ -272,7 +288,7 @@ def _make_layer_fn(
                 splash_block_size=spec.splash_block_size,
                 mesh=mesh,
             )
-            return post_fn(blk, resid_lam, x0_lam, x, x0, y)
+            return post_fn(blk, q_blk, resid_lam, x0_lam, x, x0, y)
 
         return split_layer
 
@@ -297,6 +313,7 @@ def forward_hidden(
     spec: ModelSpec,
     compute_dtype,
     mesh: Optional[Mesh] = None,
+    q_blocks: Optional[dict] = None,
 ) -> jax.Array:
     """Run embedding + scanned transformer stack + final RMSNorm; returns `(B, T, C)` in compute_dtype."""
     T = idx.shape[1]
@@ -312,29 +329,30 @@ def forward_hidden(
     G = len(pattern)
     short_win = (max(1, spec.sequence_len // 2), 0)
     ve_table = params.get("value_embeds", None)
+    q_scan = q_blocks if q_blocks is not None else {}
 
     if pattern == "L":
         layer_fn = _make_layer_fn(spec, None, compute_dtype, mesh)
         if ve_table is not None:
             def scan_body_ve(carry_x, layer_inputs):
-                blk, r_lam, x0_lam, ve_w = layer_inputs
-                return layer_fn(blk, r_lam, x0_lam, carry_x, x0, ve_w[idx], cos_t, sin_t), None
+                blk, qb, r_lam, x0_lam, ve_w = layer_inputs
+                return layer_fn(blk, qb or None, r_lam, x0_lam, carry_x, x0, ve_w[idx], cos_t, sin_t), None
 
             x, _ = jax.lax.scan(
                 scan_body_ve,
                 x,
-                (params["blocks"], params["resid_lambdas"], params["x0_lambdas"], ve_table),
+                (params["blocks"], q_scan, params["resid_lambdas"], params["x0_lambdas"], ve_table),
                 unroll=spec.scan_unroll,
             )
         else:
             def scan_body_nove(carry_x, layer_inputs):
-                blk, r_lam, x0_lam = layer_inputs
-                return layer_fn(blk, r_lam, x0_lam, carry_x, x0, None, cos_t, sin_t), None
+                blk, qb, r_lam, x0_lam = layer_inputs
+                return layer_fn(blk, qb or None, r_lam, x0_lam, carry_x, x0, None, cos_t, sin_t), None
 
             x, _ = jax.lax.scan(
                 scan_body_nove,
                 x,
-                (params["blocks"], params["resid_lambdas"], params["x0_lambdas"]),
+                (params["blocks"], q_scan, params["resid_lambdas"], params["x0_lambdas"]),
                 unroll=spec.scan_unroll,
             )
 
@@ -349,33 +367,36 @@ def forward_hidden(
             return arr.reshape((n_groups, G) + arr.shape[1:])
 
         grouped_blocks = jax.tree_util.tree_map(reshape_group, params["blocks"])
+        grouped_q = jax.tree_util.tree_map(reshape_group, q_scan)
         grouped_r = reshape_group(params["resid_lambdas"])
         grouped_x0 = reshape_group(params["x0_lambdas"])
         grouped_ve = reshape_group(ve_table) if ve_table is not None else None
 
         if grouped_ve is not None:
             def group_body_ve(carry_x, grp):
-                g_blk, g_r, g_x0, g_ve = grp
+                g_blk, g_qb, g_r, g_x0, g_ve = grp
                 cur = carry_x
                 for g in range(G):
                     blk_g = jax.tree_util.tree_map(lambda a: a[g], g_blk)
-                    cur = group_fns[g](blk_g, g_r[g], g_x0[g], cur, x0, g_ve[g][idx], cos_t, sin_t)
+                    qb_g = jax.tree_util.tree_map(lambda a: a[g], g_qb) if g_qb else None
+                    cur = group_fns[g](blk_g, qb_g, g_r[g], g_x0[g], cur, x0, g_ve[g][idx], cos_t, sin_t)
                 return cur, None
 
             x, _ = jax.lax.scan(
-                group_body_ve, x, (grouped_blocks, grouped_r, grouped_x0, grouped_ve), unroll=spec.scan_unroll
+                group_body_ve, x, (grouped_blocks, grouped_q, grouped_r, grouped_x0, grouped_ve), unroll=spec.scan_unroll
             )
         else:
             def group_body_nove(carry_x, grp):
-                g_blk, g_r, g_x0 = grp
+                g_blk, g_qb, g_r, g_x0 = grp
                 cur = carry_x
                 for g in range(G):
                     blk_g = jax.tree_util.tree_map(lambda a: a[g], g_blk)
-                    cur = group_fns[g](blk_g, g_r[g], g_x0[g], cur, x0, None, cos_t, sin_t)
+                    qb_g = jax.tree_util.tree_map(lambda a: a[g], g_qb) if g_qb else None
+                    cur = group_fns[g](blk_g, qb_g, g_r[g], g_x0[g], cur, x0, None, cos_t, sin_t)
                 return cur, None
 
             x, _ = jax.lax.scan(
-                group_body_nove, x, (grouped_blocks, grouped_r, grouped_x0), unroll=spec.scan_unroll
+                group_body_nove, x, (grouped_blocks, grouped_q, grouped_r, grouped_x0), unroll=spec.scan_unroll
             )
 
     else:
@@ -384,8 +405,9 @@ def forward_hidden(
             win = short_win if char == "S" else None
             layer_fn = _make_layer_fn(spec, win, compute_dtype, mesh)
             blk_i = jax.tree_util.tree_map(lambda a: a[i], params["blocks"])
+            qb_i = jax.tree_util.tree_map(lambda a: a[i], q_blocks) if q_blocks is not None else None
             ve_tok = ve_table[i][idx] if ve_table is not None else None
-            x = layer_fn(blk_i, params["resid_lambdas"][i], params["x0_lambdas"][i], x, x0, ve_tok, cos_t, sin_t)
+            x = layer_fn(blk_i, qb_i, params["resid_lambdas"][i], params["x0_lambdas"][i], x, x0, ve_tok, cos_t, sin_t)
 
     return rms_norm(x)
 
@@ -495,6 +517,99 @@ def _make_fused_chunked_loss_fn(softcap: float, z_loss_weight: float):
     return _fused_loss
 
 
+def _make_fused_chunked_loss_int8_bwd_fn(softcap: float, z_loss_weight: float, mesh: Optional[Mesh]):
+    """
+    Single-pass Cut-Cross-Entropy with 100% exact BF16->FP32 forward logits + softmax,
+    and 394-TOPS INT8 MXU backward (`d_x` & `d_lm_w`) using pre-quantized `lm_w_qb`.
+    """
+    @jax.custom_vjp
+    def _fused_loss(x_ch, lm_w, lm_w_qb, lm_w_sb, y_ch, scale):
+        n_chunks = x_ch.shape[0]
+        inv_n = jnp.float32(1.0 / n_chunks)
+
+        def fwd_only_body(carry, pair):
+            ce_acc, z_acc = carry
+            xc, yc = pair
+            nll_c, z_c = _chunk_ce_and_z(xc, yc, lm_w, softcap)
+            return (ce_acc + jnp.mean(nll_c, dtype=jnp.float32), z_acc + z_c), None
+
+        (ce_sum, z_sum), _ = jax.lax.scan(
+            fwd_only_body, (jnp.float32(0.0), jnp.float32(0.0)), (x_ch, y_ch)
+        )
+        ce = ce_sum * inv_n
+        z = z_sum * inv_n
+        tot = (ce + jnp.float32(z_loss_weight) * z) * scale
+        return tot, ce, z
+
+    def _fused_fwd(x_ch, lm_w, lm_w_qb, lm_w_sb, y_ch, scale):
+        n_chunks = x_ch.shape[0]
+        chunk_tok = x_ch.shape[1]
+        vocab_size = lm_w.shape[1]
+        inv_n = jnp.float32(1.0 / n_chunks)
+        chunk_scale = scale * inv_n
+        tok_scale = chunk_scale / jnp.float32(chunk_tok)
+        dw_acc_dtype = jnp.float32 if lm_w.dtype == jnp.float16 else lm_w.dtype
+        dw_init = jnp.zeros_like(lm_w, dtype=dw_acc_dtype)
+
+        def scan_body(carry, pair):
+            tot_acc, ce_acc, z_acc, dw_acc = carry
+            xc, yc = pair
+            raw = jnp.dot(xc, lm_w, preferred_element_type=jnp.float32)
+            if softcap > 0.0:
+                th = jnp.tanh(raw / softcap)
+                logits = softcap * th
+            else:
+                th = None
+                logits = raw
+
+            log_z = jax.scipy.special.logsumexp(logits, axis=-1)
+            target_logits = jnp.take_along_axis(logits, yc[..., None], axis=-1)[..., 0]
+            ce_c = jnp.mean(log_z - target_logits, dtype=jnp.float32)
+            z_c = jnp.mean(log_z * log_z, dtype=jnp.float32)
+            tot_c = (ce_c + jnp.float32(z_loss_weight) * z_c) * chunk_scale
+
+            # Analytical O(1) unnormalized dL/d(raw_logits) — fuses one_hot in XLA VPU!
+            probs = jnp.exp(logits - log_z[:, None])
+            d_logits = probs * (jnp.float32(1.0) + jnp.float32(2.0 * z_loss_weight) * log_z[:, None])
+            d_logits = d_logits - jax.nn.one_hot(yc, vocab_size, dtype=jnp.float32)
+            d_raw = d_logits * (jnp.float32(1.0) - th * th) if th is not None else d_logits
+
+            # 394-TOPS INT8 backward d_x = d_raw @ lm_w.T (1-byte pre-quantized lm_w_qb!)
+            dr_q, dr_s = quantize_int8(d_raw, axis=-1)
+            dx_i32 = jnp.dot(dr_q, lm_w_qb.T, preferred_element_type=jnp.int32)
+            dx_c = (dx_i32.astype(jnp.float32) * (dr_s * lm_w_sb.T) * tok_scale).astype(xc.dtype)
+
+            # 394-TOPS INT8 backward d_w = x.T @ d_raw (FSDP-local bf16 psum_scatter on v5e-8!)
+            xt_q, xt_s = _quantize_x_for_dw_int8(xc, mesh)
+            dw_unnorm = _dw_from_saved_xt_int8(xt_q, xt_s, d_raw, dw_acc_dtype, mesh)
+            dw_acc = dw_acc + (dw_unnorm.astype(jnp.float32) * tok_scale).astype(dw_acc_dtype)
+            return (tot_acc + tot_c, ce_acc + ce_c, z_acc + z_c, dw_acc), dx_c
+
+        (tot_sum, ce_sum, z_sum, dw_sum), dx_chunks = jax.lax.scan(
+            scan_body,
+            (jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0), dw_init),
+            (x_ch, y_ch),
+        )
+        ce = ce_sum * inv_n
+        z = z_sum * inv_n
+        return (tot_sum, ce, z), (dx_chunks, dw_sum.astype(lm_w.dtype))
+
+    def _fused_bwd(res, g_out):
+        dx_chunks, d_lm_w = res
+        g_tot, _, _ = g_out
+        return (
+            dx_chunks * g_tot.astype(dx_chunks.dtype),
+            d_lm_w * g_tot.astype(d_lm_w.dtype),
+            None,
+            None,
+            None,
+            None,
+        )
+
+    _fused_loss.defvjp(_fused_fwd, _fused_bwd)
+    return _fused_loss
+
+
 def _pack_fsdp_chunks(x: jax.Array, targets: jax.Array, chunk_sz: int, mesh: Optional[Mesh]):
     """
     Pack `(B, T, C)` and `(B, T)` into `(n_chunks, n_dev * chunk_sz, C)` so every FSDP chip
@@ -522,18 +637,24 @@ def forward_scalar_loss_and_z(
     compute_dtype,
     scale: jax.Array,
     mesh: Optional[Mesh] = None,
+    q_cache: Optional[dict] = None,
 ):
     """
     Training loss entry point returning `(scaled_total_loss, mean_ce, mean_z)`.
     Uses single-pass fused Cut-Cross-Entropy when chunking applies (0% lm_head recompute,
     ~16x lower logits HBM, and zero cross-chip resharding on multi-chip FSDP!).
     """
-    x = forward_hidden(params, idx, cos, sin, spec, compute_dtype, mesh=mesh)
+    q_blocks = q_cache["blocks"] if (q_cache is not None and "blocks" in q_cache) else None
+    x = forward_hidden(params, idx, cos, sin, spec, compute_dtype, mesh=mesh, q_blocks=q_blocks)
     lm_w = params["wte"].T.astype(compute_dtype) if spec.tie_embeddings else params["lm_head"].astype(compute_dtype)
 
     packed = _pack_fsdp_chunks(x, targets, spec.loss_chunk_size, mesh)
     if packed is not None:
         x_chunks, y_chunks, _, _ = packed
+        if spec.matmul_quant == "int8-all" and q_cache is not None and "lm_head_bwd" in q_cache:
+            lm_w_qb, lm_w_sb = q_cache["lm_head_bwd"]
+            fused_q_fn = _make_fused_chunked_loss_int8_bwd_fn(spec.softcap, spec.z_loss_weight, mesh)
+            return fused_q_fn(x_chunks, lm_w, lm_w_qb, lm_w_sb, y_chunks, scale)
         fused_fn = _make_fused_chunked_loss_fn(spec.softcap, spec.z_loss_weight)
         return fused_fn(x_chunks, lm_w, y_chunks, scale)
 
