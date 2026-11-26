@@ -28,8 +28,12 @@ class ModelSpec:
     activation: str = "swiglu"       # "swiglu" | "relu2" | "gelu"
     window_pattern: str = "L"        # "L" (full), "SL", or "SSSL"
     use_qk_norm: bool = True
+    use_qk_gain: bool = False        # Learnable per-head QK-norm gain (frees unit-RMS attention temperature)
     use_value_embeds: bool = False   # ResFormer value embeddings (alternating/periodic)
     ve_stride: int = 1               # 1=every layer, 2=alternating layers (halves VE params & HBM!)
+    use_v0_residual: bool = False    # ResFormer layer-0 value residual (v += lam * v0; zero extra GEMMs)
+    use_attn_gate: bool = False      # Qwen3/NeurIPS'25 headwise SDPA output sigmoid gate (kills sinks & outliers)
+    use_smear: bool = False          # Modded-nanogpt 1-token learned bigram smear after wte (13 params!)
     use_resid_lambdas: bool = True   # Per-layer residual + x0 skip scalars (nanochat)
     use_unet_skip: bool = False      # Modded-nanogpt symmetric encoder->decoder U-Net skip connections
     tie_embeddings: bool = False     # Tie wte & lm_head weights
@@ -161,8 +165,9 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         remat_policy="save_attn",
         loss_chunk_size=2048,
     ),
-    # ~1.37B total / 1.036B active-FLOPs Round-2 autoresearch champion (-0.11 BPB on mix-1b + 8.5% faster U-Net scan!):
-    # ResFormer Value Embeddings + SSSL window + U-Net skips + RoPE 50k + z_loss 5e-4.
+    # ~1.37B total / 1.036B active-FLOPs Round-3 Quad-Crown autoresearch champion (-0.1409 BPB on live mix-1b!):
+    # Value Embeddings + SSSL window + U-Net skips + Qwen3 Gated Attention + 13-float Bigram Smear +
+    # ResFormer v0 residual + gentle QK-norm gain + RoPE 50k + z_loss 5e-4.
     # Recommended optimizer flags: --matrix-lr 0.06 --embedding-lr 0.5 --weight-decay 0.03
     "1b-ve": ModelSpec(
         sequence_len=2048,
@@ -174,7 +179,11 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         mlp_hidden=5632,
         activation="swiglu",
         window_pattern="SSSL",
+        use_qk_gain=True,
         use_value_embeds=True,
+        use_v0_residual=True,
+        use_attn_gate=True,
+        use_smear=True,
         use_unet_skip=True,
         rope_base=50000.0,
         z_loss_weight=5e-4,
@@ -224,6 +233,7 @@ class TrainConfig:
     muon_beta2: float = 0.95
     muon_ns_steps: int = 5
     muon_vmap: bool = False           # False = low-HBM lax.scan; True = batched vmap (great on v5e-8 / G4!)
+    gate_adamw: bool = False          # Use AdamW (not Muon) for tiny gate tensors (ve_gate, w_attn_gate)
     grad_clip: float = 1.0
 
     # WSD (Warmup -> Stable -> Decay) schedule for seamless multi-session pretraining!

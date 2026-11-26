@@ -113,7 +113,7 @@ Once `autoresearch-xla` discovers a strong architecture/optimizer recipe at prox
   - **Pure-BF16 Master Weights + Unbiased Stochastic Rounding** (`--param-dtype bfloat16`, [`scale/quant.py`](scale/quant.py)): cuts 1B weight HBM by ~3× (`5.93 GB → 1.98 GB`), eliminates `fp32→bf16` staging casts, and unlocks `save_all_compute` even on a single 16 GB chip
   - **Pre-Quantized 1-Byte INT8 / FP8 Linear Engine** (`--matmul-quant int8 | int8-all | fp8`): pre-quantizes weights ONCE per step before gradient accumulation (halving weight HBM reads & multi-chip FSDP AllGather ICI traffic to 1 byte/weight!), saves 1-byte INT8 activations for `d_w`, uses reciprocal-multiply VPU quant, and runs FSDP-local `bf16` `d_w` `psum_scatter` on `v5e-8` — hitting **`84.83%` BF16-eq MFU (`24,505 tok/s`) on 1.036B** while **beating pure BF16 on live `mix-1b` `val_bpb`** (`1.807677`/`1.807863` vs `1.808011`)!
   - All 10 verified MaxText TPU `v5e-8` FSDP flags (`windowed_einsum` + backward AllGather pipelining + async collective fusion), 90% GPU VRAM preallocation, optional `--muon-vmap`, and async H2D double-buffering
-  - **Autoresearch-discovered `1b-ve` preset**: Two-round proxy sweep on live `mix-1b` (`100m`, 15.7M tokens/exp) found ResFormer Value Embeddings (`use_value_embeds=True`, zero extra GEMM FLOPs!) + `SSSL` sliding window + modded-nanogpt **U-Net skip connections** (`use_unet_skip=True`, **+8.5% faster scan!**) + `rope_base=50000` + `z_loss=5e-4` + `--matrix-lr 0.06 --embedding-lr 0.5 --weight-decay 0.03` slashes `val_bpb` by **`-0.1118` BPB** (`1.7867 → 1.6749`; `1.6772` & best train loss `4.3117` with U-Net skips; `ve_stride=2` retains 94% of VE gain at half VE HBM!).
+  - **Autoresearch-discovered `1b-ve` preset**: Three-round proxy sweep on live `mix-1b` (`100m`, 15.7M tokens/exp) stacked ResFormer Value Embeddings (`use_value_embeds=True`) + `SSSL` window + modded-nanogpt **U-Net skip connections** (`use_unet_skip=True`) + **Qwen3 Headwise Gated Attention** (`use_attn_gate=True`) + **13-float Bigram Token Smear** (`use_smear=True`) + **ResFormer `v0` Value Residual** (`use_v0_residual=True`) + **gentle per-head QK-norm gain** (`use_qk_gain=True`, `0.05×` scalar LR) + `rope_base=50000` + `z_loss=5e-4` + `--matrix-lr 0.06 --embedding-lr 0.5 --weight-decay 0.03` — slashing `val_bpb` by **`-0.1409` BPB** (`1.7867 → 1.6458`, train loss `4.1612`!) at `+0.02%` extra active params!
 - **Disk-bounded Multi-Dataset Streaming Mixer** ([`scale/data.py`](scale/data.py)): Deterministic smooth-weighted streaming across public, ungated HF Parquet corpora with exact per-source resumable `DataCursor` and rolling `/tmp` cleanup (`~3.4 GB` live verified on `mix-1b`, safe on Kaggle's 20 GB cap!):
   - `mix-1b` *(recommended 1B stable phase)*: `65%` ClimbMix-400B + `15%` CodeParrot-Clean (Python) + `10%` FineMath-4plus + `10%` Cosmopedia-v2
   - `mix-cooldown` *(recommended WSD decay phase)*: `40%` ClimbMix + `20%` Cosmopedia-v2 + `20%` FineMath-4plus + `20%` CodeParrot
@@ -140,9 +140,9 @@ Once `autoresearch-xla` discovers a strong architecture/optimizer recipe at prox
 
 ```bash
 # Multi-session 1B pretraining on Kaggle TPU v5e-8 (stable phase on mix-1b, ~190K tok/s -> ~28h for 20B tokens!):
-# Use `--preset 1b` (1.036B dense) OR `--preset 1b-ve` (1.37B total / 1.036B active Round-2 autoresearch champion, -0.11 BPB!)
+# Use `--preset 1b` (1.036B dense) OR `--preset 1b-ve` (1.37B total / 1.036B active Round-3 Quad-Crown champion, -0.141 BPB!)
 python -m scale.pretrain --preset 1b-ve --dataset mix-1b \
-    --remat-policy save_all_compute --splash-block-size 1024 \
+    --remat-policy save_all_compute --splash-block-size 1024 --loss-chunk-size 4096 \
     --param-dtype bfloat16 --opt-dtype bfloat16 --matmul-quant int8-all --muon-vmap \
     --matrix-lr 0.06 --embedding-lr 0.5 --weight-decay 0.03 \
     --sync-backend hf --remote-target <your-user>/my-1b-base \
@@ -150,7 +150,7 @@ python -m scale.pretrain --preset 1b-ve --dataset mix-1b \
 
 # Trigger final WSD cooldown decay in pure BF16 on high-density mix-cooldown (~16-18B tokens, same checkpoint!):
 python -m scale.pretrain --preset 1b-ve --dataset mix-cooldown \
-    --remat-policy save_all_compute --splash-block-size 1024 \
+    --remat-policy save_all_compute --splash-block-size 1024 --loss-chunk-size 4096 \
     --param-dtype bfloat16 --opt-dtype bfloat16 --matmul-quant none --muon-vmap \
     --matrix-lr 0.06 --embedding-lr 0.5 --weight-decay 0.03 \
     --sync-backend hf --remote-target <your-user>/my-1b-base \

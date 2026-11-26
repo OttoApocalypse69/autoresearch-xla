@@ -91,6 +91,8 @@ def init_params(key: jax.Array, spec: ModelSpec, param_dtype=jnp.float32) -> dic
 
     if spec.use_value_embeds:
         blocks["ve_gate"] = jnp.zeros((L, ve_ch, spec.n_kv_head), dtype=param_dtype)
+    if spec.use_attn_gate:
+        blocks["w_attn_gate"] = jnp.zeros((L, C, spec.n_head), dtype=param_dtype)
 
     params: dict = {
         "wte": (
@@ -112,6 +114,13 @@ def init_params(key: jax.Array, spec: ModelSpec, param_dtype=jnp.float32) -> dic
         ).astype(param_dtype)
     if spec.use_unet_skip:
         params["unet_lambdas"] = jnp.zeros((L // 2,), dtype=jnp.float32)
+    if spec.use_qk_gain:
+        params["qk_gain"] = jnp.full((L, spec.n_head), 1.3, dtype=jnp.float32)
+    if spec.use_v0_residual:
+        params["v0_lambdas"] = jnp.zeros((L,), dtype=jnp.float32)
+    if spec.use_smear:
+        params["smear_gate"] = jnp.zeros((min(12, C), 1), dtype=jnp.float32)
+        params["smear_lambda"] = jnp.array(0.0, dtype=jnp.float32)
     return params
 
 
@@ -146,6 +155,9 @@ def _pre_attn_subblock(
     x: jax.Array,
     x0: jax.Array,
     ve_tok: Optional[jax.Array],
+    v0: Optional[jax.Array],
+    v0_lam: Optional[jax.Array],
+    qk_gain: Optional[jax.Array],
     cos: jax.Array,
     sin: jax.Array,
     spec: ModelSpec,
@@ -174,12 +186,23 @@ def _pre_attn_subblock(
         gate = 2.0 * jax.nn.sigmoid(jnp.dot(h[..., :ve_ch], blk["ve_gate"].astype(compute_dtype)))
         v = v + gate[..., None] * ve_h
 
+    if v0 is not None and v0_lam is not None:
+        v = v + v0_lam.astype(compute_dtype) * v0
+
     q = apply_rotary_emb(q, cos, sin)
     k = apply_rotary_emb(k, cos, sin)
     if spec.use_qk_norm:
         q = rms_norm(q)
         k = rms_norm(k)
-    return q, k, v
+    if qk_gain is not None:
+        q = q * qk_gain.astype(compute_dtype)[None, None, :, None]
+
+    attn_gate = None
+    if spec.use_attn_gate and "w_attn_gate" in blk:
+        attn_gate = jax.nn.sigmoid(
+            jnp.dot(h, blk["w_attn_gate"].astype(compute_dtype)) + jnp.asarray(1.0, compute_dtype)
+        )
+    return q, k, v, attn_gate
 
 
 def _post_attn_mlp_subblock(
@@ -232,6 +255,9 @@ def _apply_single_layer(
     x: jax.Array,
     x0: jax.Array,
     ve_tok: Optional[jax.Array],
+    v0: Optional[jax.Array],
+    v0_lam: Optional[jax.Array],
+    qk_gain: Optional[jax.Array],
     cos: jax.Array,
     sin: jax.Array,
     spec: ModelSpec,
@@ -239,7 +265,9 @@ def _apply_single_layer(
     compute_dtype,
     mesh: Optional[Mesh],
 ) -> jax.Array:
-    q, k, v = _pre_attn_subblock(blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, cos, sin, spec, compute_dtype, mesh=mesh)
+    q, k, v, attn_gate = _pre_attn_subblock(
+        blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, v0, v0_lam, qk_gain, cos, sin, spec, compute_dtype, mesh=mesh
+    )
     y = fused_causal_attention(
         q,
         k,
@@ -249,6 +277,8 @@ def _apply_single_layer(
         splash_block_size=spec.splash_block_size,
         mesh=mesh,
     )
+    if attn_gate is not None:
+        y = y * attn_gate[..., None]
     y = checkpoint_name(y, "context")
     return _post_attn_mlp_subblock(blk, q_blk, resid_lam, x0_lam, x, x0, y, spec, compute_dtype, mesh=mesh)
 
@@ -280,8 +310,8 @@ def _make_layer_fn(
             policy=post_pol,
         )
 
-        def split_layer(blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, cos, sin):
-            q, k, v = pre_fn(blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, cos, sin)
+        def split_layer(blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, v0, v0_lam, qk_gain, cos, sin):
+            q, k, v, attn_gate = pre_fn(blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, v0, v0_lam, qk_gain, cos, sin)
             y = fused_causal_attention(
                 q,
                 k,
@@ -291,6 +321,8 @@ def _make_layer_fn(
                 splash_block_size=spec.splash_block_size,
                 mesh=mesh,
             )
+            if attn_gate is not None:
+                y = y * attn_gate[..., None]
             return post_fn(blk, q_blk, resid_lam, x0_lam, x, x0, y)
 
         return split_layer
@@ -328,7 +360,21 @@ def forward_hidden(
 
     x = params["wte"][idx].astype(compute_dtype)
     x = rms_norm(x)
+    if spec.use_smear and "smear_gate" in params:
+        sm_ch = min(12, spec.n_embd)
+        sm_gate = jax.nn.sigmoid(jnp.dot(x[..., :sm_ch], params["smear_gate"].astype(compute_dtype)))
+        x_prev = jnp.concatenate([jnp.zeros_like(x[:, :1]), x[:, :-1]], axis=1)
+        x = rms_norm(x + (params["smear_lambda"].astype(compute_dtype) * sm_gate) * x_prev)
     x0 = x
+
+    v0 = None
+    v0_lams = params.get("v0_lambdas", None) if spec.use_v0_residual else None
+    if v0_lams is not None:
+        B_cur, T_cur, C_cur = x0.shape
+        w_v0 = params["blocks"]["w_qkv"][0, :, C_cur + spec.kv_dim :].astype(compute_dtype)
+        v0 = jnp.dot(x0.reshape(B_cur * T_cur, C_cur), w_v0).reshape(B_cur, T_cur, spec.n_kv_head, spec.head_dim)
+
+    qk_gains = params.get("qk_gain", None) if spec.use_qk_gain else None
 
     pattern = spec.window_pattern.upper()
     ve_table = params.get("value_embeds", None)
@@ -355,13 +401,15 @@ def forward_hidden(
         grouped_q = jax.tree_util.tree_map(reshape_group, q_scan)
         grouped_r = reshape_group(params["resid_lambdas"])
         grouped_x0 = reshape_group(params["x0_lambdas"])
+        grouped_v0l = reshape_group(v0_lams) if v0_lams is not None else None
+        grouped_qkg = reshape_group(qk_gains) if qk_gains is not None else None
         if ve_table is not None:
             ve_per_grp = G // ve_stride
             grouped_ve = ve_table.reshape((n_groups, ve_per_grp) + ve_table.shape[1:])
         else:
             grouped_ve = None
 
-        def _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_skip_lams=None, g_skips=None):
+        def _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg, g_skip_lams=None, g_skips=None):
             cur = carry_x
             outs = []
             for g in range(G):
@@ -370,7 +418,9 @@ def forward_hidden(
                 blk_g = jax.tree_util.tree_map(lambda a: a[g], g_blk)
                 qb_g = jax.tree_util.tree_map(lambda a: a[g], g_qb) if g_qb else None
                 ve_tok = g_ve[g // ve_stride][idx] if (g_ve is not None and g % ve_stride == 0) else None
-                cur = group_fns[g](blk_g, qb_g, g_r[g], g_x0[g], cur, x0, ve_tok, cos_t, sin_t)
+                v0_l = g_v0l[g] if g_v0l is not None else None
+                qk_g = g_qkg[g] if g_qkg is not None else None
+                cur = group_fns[g](blk_g, qb_g, g_r[g], g_x0[g], cur, x0, ve_tok, v0, v0_l, qk_g, cos_t, sin_t)
                 outs.append(cur)
             return cur, outs
 
@@ -383,8 +433,8 @@ def forward_hidden(
             n_skip = enc_g * G
 
             def enc_body(carry_x, grp):
-                g_blk, g_qb, g_r, g_x0, g_ve = grp
-                cur, outs = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve)
+                g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg = grp
+                cur, outs = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg)
                 return cur, jnp.stack(outs, axis=0)
 
             enc_in = (
@@ -393,6 +443,8 @@ def forward_hidden(
                 grouped_r[:enc_g],
                 grouped_x0[:enc_g],
                 grouped_ve[:enc_g] if grouped_ve is not None else None,
+                grouped_v0l[:enc_g] if grouped_v0l is not None else None,
+                grouped_qkg[:enc_g] if grouped_qkg is not None else None,
             )
             x, enc_skips = jax.lax.scan(enc_body, x, enc_in, unroll=spec.scan_unroll)
             # Reverse encoder layer outputs so decoder layer (L-1-i) pairs with encoder layer i
@@ -402,8 +454,8 @@ def forward_hidden(
 
             if dec_start > enc_g:
                 def mid_body(carry_x, grp):
-                    g_blk, g_qb, g_r, g_x0, g_ve = grp
-                    cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve)
+                    g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg = grp
+                    cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg)
                     return cur, None
 
                 mid_in = (
@@ -412,12 +464,14 @@ def forward_hidden(
                     grouped_r[enc_g:dec_start],
                     grouped_x0[enc_g:dec_start],
                     grouped_ve[enc_g:dec_start] if grouped_ve is not None else None,
+                    grouped_v0l[enc_g:dec_start] if grouped_v0l is not None else None,
+                    grouped_qkg[enc_g:dec_start] if grouped_qkg is not None else None,
                 )
                 x, _ = jax.lax.scan(mid_body, x, mid_in, unroll=spec.scan_unroll)
 
             def dec_body(carry_x, grp):
-                g_blk, g_qb, g_r, g_x0, g_ve, g_ul, g_sk = grp
-                cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_ul, g_sk)
+                g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg, g_ul, g_sk = grp
+                cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg, g_ul, g_sk)
                 return cur, None
 
             dec_in = (
@@ -426,20 +480,22 @@ def forward_hidden(
                 grouped_r[dec_start:n_groups],
                 grouped_x0[dec_start:n_groups],
                 grouped_ve[dec_start:n_groups] if grouped_ve is not None else None,
+                grouped_v0l[dec_start:n_groups] if grouped_v0l is not None else None,
+                grouped_qkg[dec_start:n_groups] if grouped_qkg is not None else None,
                 dec_lams,
                 dec_skips,
             )
             x, _ = jax.lax.scan(dec_body, x, dec_in, unroll=spec.scan_unroll)
         else:
             def std_body(carry_x, grp):
-                g_blk, g_qb, g_r, g_x0, g_ve = grp
-                cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve)
+                g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg = grp
+                cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg)
                 return cur, None
 
             x, _ = jax.lax.scan(
                 std_body,
                 x,
-                (grouped_blocks, grouped_q, grouped_r, grouped_x0, grouped_ve),
+                (grouped_blocks, grouped_q, grouped_r, grouped_x0, grouped_ve, grouped_v0l, grouped_qkg),
                 unroll=spec.scan_unroll,
             )
 
@@ -456,7 +512,9 @@ def forward_hidden(
             blk_i = jax.tree_util.tree_map(lambda a: a[i], params["blocks"])
             qb_i = jax.tree_util.tree_map(lambda a: a[i], q_blocks) if q_blocks is not None else None
             ve_tok = ve_table[i // ve_stride][idx] if (ve_table is not None and i % ve_stride == 0) else None
-            x = layer_fn(blk_i, qb_i, params["resid_lambdas"][i], params["x0_lambdas"][i], x, x0, ve_tok, cos_t, sin_t)
+            v0_l = v0_lams[i] if v0_lams is not None else None
+            qk_g = qk_gains[i] if qk_gains is not None else None
+            x = layer_fn(blk_i, qb_i, params["resid_lambdas"][i], params["x0_lambdas"][i], x, x0, ve_tok, v0, v0_l, qk_g, cos_t, sin_t)
             if unet_lams is not None and i < half:
                 skips_list.append(x)
 
@@ -770,7 +828,8 @@ def count_params(params: dict) -> dict[str, int]:
     lm_head = int(params["lm_head"].size) if "lm_head" in params else 0
     ve = int(params["value_embeds"].size) if "value_embeds" in params else 0
     blocks = sum(int(a.size) for a in jax.tree_util.tree_leaves(params["blocks"]))
-    scalars = int(params["resid_lambdas"].size + params["x0_lambdas"].size)
+    scalar_keys = ("resid_lambdas", "x0_lambdas", "unet_lambdas", "qk_gain", "v0_lambdas", "smear_gate", "smear_lambda")
+    scalars = sum(int(params[k].size) for k in scalar_keys if k in params)
     total = wte + lm_head + ve + blocks + scalars
     return {
         "wte": wte,

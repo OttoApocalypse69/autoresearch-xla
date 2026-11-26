@@ -23,7 +23,11 @@ POLAR_EXPRESS_COEFFS = (
 )
 
 
-def init_opt_state(params: dict, opt_dtype=jnp.float32) -> dict:
+GATE_BLOCK_KEYS = ("ve_gate", "w_attn_gate")
+EXTRA_SCALAR_KEYS = ("unet_lambdas", "qk_gain", "v0_lambdas", "smear_gate", "smear_lambda")
+
+
+def init_opt_state(params: dict, opt_dtype=jnp.float32, gate_adamw: bool = False) -> dict:
     """Create optimizer state pytree matching `params` (supports fp32 or bf16 state)."""
     def adamw_zeros(arr):
         return {
@@ -33,6 +37,9 @@ def init_opt_state(params: dict, opt_dtype=jnp.float32) -> dict:
 
     block_states = {}
     for name, w in params["blocks"].items():
+        if gate_adamw and name in GATE_BLOCK_KEYS:
+            block_states[name] = adamw_zeros(w)
+            continue
         # Stacked block tensor: (n_layer, rows, cols)
         L, r, c = w.shape
         sec_shape = (L, r, 1) if r >= c else (L, 1, c)
@@ -52,8 +59,9 @@ def init_opt_state(params: dict, opt_dtype=jnp.float32) -> dict:
         state["lm_head"] = adamw_zeros(params["lm_head"])
     if "value_embeds" in params:
         state["value_embeds"] = adamw_zeros(params["value_embeds"])
-    if "unet_lambdas" in params:
-        state["unet_lambdas"] = adamw_zeros(params["unet_lambdas"])
+    for k in EXTRA_SCALAR_KEYS:
+        if k in params:
+            state[k] = adamw_zeros(params[k])
     return state
 
 
@@ -216,14 +224,28 @@ def optimizer_step(
         params["x0_lambdas"], grads["x0_lambdas"], opt_state["x0_lambdas"], step_f,
         tcfg.scalar_lr * lrm, 0.96, 0.95, next_sr_key(),
     )
-    if "unet_lambdas" in params:
-        new_params["unet_lambdas"], new_state["unet_lambdas"] = _adamw_update(
-            params["unet_lambdas"], grads["unet_lambdas"], opt_state["unet_lambdas"], step_f,
-            tcfg.scalar_lr * lrm, 0.96, 0.95, next_sr_key(),
-        )
+    for k in EXTRA_SCALAR_KEYS:
+        if k in params:
+            k_lr = (tcfg.scalar_lr * 0.05 if k == "qk_gain" else tcfg.scalar_lr) * lrm
+            new_params[k], new_state[k] = _adamw_update(
+                params[k], grads[k], opt_state[k], step_f,
+                k_lr, 0.96, 0.95, next_sr_key(),
+            )
 
     new_blocks, st_blocks = {}, {}
     for name in params["blocks"]:
+        if tcfg.gate_adamw and name in GATE_BLOCK_KEYS:
+            new_blocks[name], st_blocks[name] = _adamw_update(
+                params["blocks"][name],
+                grads["blocks"][name],
+                opt_state["blocks"][name],
+                step_f,
+                tcfg.scalar_lr * lrm,
+                b1,
+                b2,
+                next_sr_key(),
+            )
+            continue
         new_blocks[name], st_blocks[name] = _muon_update_blocks(
             params["blocks"][name],
             grads["blocks"][name],

@@ -564,10 +564,14 @@ for qmode in ("int8", "int8-all", "fp8"):
 
 
 def test_round2_unet_ve_stride_single_chunk_fsdp():
-    """Verify Round-2 champion preset (1b-ve) and 8-device FSDP training with U-Net skips, ve_stride=2, SSSL, and single-chunk INT8 loss."""
+    """Verify Round-3 Quad-Crown preset (1b-ve) and 8-device FSDP training with U-Net skips, ve_stride=2, attn_gate, smear, v0_residual, qk_gain, SSSL, and single-chunk INT8 loss."""
     spec_1b_ve = get_model_preset("1b-ve")
     assert spec_1b_ve.use_value_embeds is True
     assert spec_1b_ve.use_unet_skip is True
+    assert spec_1b_ve.use_attn_gate is True
+    assert spec_1b_ve.use_smear is True
+    assert spec_1b_ve.use_v0_residual is True
+    assert spec_1b_ve.use_qk_gain is True
     assert spec_1b_ve.window_pattern == "SSSL"
     assert spec_1b_ve.rope_base == 50000.0
     assert spec_1b_ve.z_loss_weight == 5e-4
@@ -585,43 +589,32 @@ from scale.quant import prequantize_model_weights
 mesh = create_fsdp_mesh()
 assert mesh.size == 8
 
-# Test both ve_stride=1 and ve_stride=2 with U-Net skips + SSSL + single-chunk loss (local_tok == loss_chunk_size == 256)
-spec_full = get_model_preset(
-    "smoke",
-    arch_overrides={
-        "n_layer": 8,
-        "window_pattern": "SSSL",
-        "use_value_embeds": True,
-        "ve_stride": 1,
-        "use_unet_skip": True,
-        "rope_base": 50000.0,
-        "z_loss_weight": 5e-4,
-        "loss_chunk_size": 256,
-        "matmul_quant": "int8-all",
-        "remat_policy": "save_all_compute",
-    },
-)
-spec_half = get_model_preset(
-    "smoke",
-    arch_overrides={
-        "n_layer": 8,
-        "window_pattern": "SSSL",
-        "use_value_embeds": True,
-        "ve_stride": 2,
-        "use_unet_skip": True,
-        "rope_base": 50000.0,
-        "z_loss_weight": 5e-4,
-        "loss_chunk_size": 256,
-        "matmul_quant": "int8-all",
-        "remat_policy": "save_all_compute",
-    },
-)
+# Test both ve_stride=1 and ve_stride=2 with full Round-3 Quad-Crown + U-Net skips + SSSL + single-chunk loss
+common_ov = {
+    "n_layer": 8,
+    "window_pattern": "SSSL",
+    "use_value_embeds": True,
+    "use_unet_skip": True,
+    "use_attn_gate": True,
+    "use_smear": True,
+    "use_v0_residual": True,
+    "use_qk_gain": True,
+    "rope_base": 50000.0,
+    "z_loss_weight": 5e-4,
+    "loss_chunk_size": 256,
+    "matmul_quant": "int8-all",
+    "remat_policy": "save_all_compute",
+}
+spec_full = get_model_preset("smoke", arch_overrides={**common_ov, "ve_stride": 1})
+spec_half = get_model_preset("smoke", arch_overrides={**common_ov, "ve_stride": 2})
 p_full = init_params(jax.random.PRNGKey(0), spec_full, param_dtype=jnp.bfloat16)
 p_half = init_params(jax.random.PRNGKey(0), spec_half, param_dtype=jnp.bfloat16)
 assert p_full["value_embeds"].shape[0] == 8
 assert p_half["value_embeds"].shape[0] == 4
 assert count_params(p_half)["total"] < count_params(p_full)["total"]
-assert "unet_lambdas" in p_half and p_half["unet_lambdas"].shape == (4,)
+for k in ("unet_lambdas", "qk_gain", "v0_lambdas", "smear_gate", "smear_lambda"):
+    assert k in p_half
+assert "w_attn_gate" in p_half["blocks"]
 
 tcfg = TrainConfig(
     total_batch_size=2048,
@@ -663,8 +656,8 @@ for _ in range(3):
     params, opt_state, ce, gnorm = step_fn(params, opt_state)
     assert np.isfinite(float(ce)) and np.isfinite(float(gnorm))
     losses.append(float(ce))
-assert losses[-1] < losses[0], f"Round-2 U-Net + ve_stride=2 loss did not decrease: {losses}"
-print(f"Round-2 8-dev FSDP OK: losses={losses}")
+assert losses[-1] < losses[0], f"Round-3 Quad-Crown 8-dev FSDP loss did not decrease: {losses}"
+print(f"Round-3 Quad-Crown 8-dev FSDP OK: losses={losses}")
 """
     res = subprocess.run(
         [PYTHON, "-c", code],
@@ -673,6 +666,6 @@ print(f"Round-2 8-dev FSDP OK: losses={losses}")
         capture_output=True,
         text=True,
     )
-    assert res.returncode == 0, f"Round-2 8-dev FSDP test failed:\n{res.stdout}\n{res.stderr}"
+    assert res.returncode == 0, f"Round-3 Quad-Crown 8-dev FSDP test failed:\n{res.stdout}\n{res.stderr}"
 
 

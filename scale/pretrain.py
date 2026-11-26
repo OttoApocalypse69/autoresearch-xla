@@ -229,13 +229,13 @@ def run_benchmark(spec: ModelSpec, tcfg: TrainConfig, warmup_steps: int = 2, tim
     key = jax.random.PRNGKey(tcfg.seed)
     init_p_fn = functools.partial(init_params, spec=spec, param_dtype=param_dtype)
     abs_p = jax.eval_shape(init_p_fn, key)
-    abs_o = jax.eval_shape(functools.partial(init_opt_state, opt_dtype=opt_dtype), abs_p)
+    abs_o = jax.eval_shape(functools.partial(init_opt_state, opt_dtype=opt_dtype, gate_adamw=tcfg.gate_adamw), abs_p)
     param_shardings = build_tree_shardings(abs_p, mesh, use_fsdp=tcfg.use_fsdp)
     opt_shardings = build_tree_shardings(abs_o, mesh, use_fsdp=tcfg.use_fsdp)
 
     params = jax.jit(init_p_fn, out_shardings=param_shardings)(key)
     opt_state = jax.jit(
-        functools.partial(init_opt_state, opt_dtype=opt_dtype),
+        functools.partial(init_opt_state, opt_dtype=opt_dtype, gate_adamw=tcfg.gate_adamw),
         in_shardings=(param_shardings,),
         out_shardings=opt_shardings,
     )(params)
@@ -368,7 +368,7 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
     key = jax.random.PRNGKey(tcfg.seed)
     init_p_fn = functools.partial(init_params, spec=spec, param_dtype=param_dtype)
     abstract_params = jax.eval_shape(init_p_fn, key)
-    abstract_opt = jax.eval_shape(functools.partial(init_opt_state, opt_dtype=opt_dtype), abstract_params)
+    abstract_opt = jax.eval_shape(functools.partial(init_opt_state, opt_dtype=opt_dtype, gate_adamw=tcfg.gate_adamw), abstract_params)
     param_shardings = build_tree_shardings(abstract_params, mesh, use_fsdp=tcfg.use_fsdp)
     opt_shardings = build_tree_shardings(abstract_opt, mesh, use_fsdp=tcfg.use_fsdp)
 
@@ -403,7 +403,7 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
     else:
         params = jax.jit(init_p_fn, out_shardings=param_shardings)(key)
         opt_state = jax.jit(
-            functools.partial(init_opt_state, opt_dtype=opt_dtype),
+            functools.partial(init_opt_state, opt_dtype=opt_dtype, gate_adamw=tcfg.gate_adamw),
             in_shardings=(param_shardings,),
             out_shardings=opt_shardings,
         )(params)
@@ -759,7 +759,11 @@ def main() -> None:
     parser.add_argument("--decay-steps", type=int, default=4000)
     parser.add_argument("--matrix-lr", type=float, default=0.02)
     parser.add_argument("--embedding-lr", type=float, default=0.3)
+    parser.add_argument("--unembedding-lr", type=float, default=0.004)
+    parser.add_argument("--scalar-lr", type=float, default=0.2)
     parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--muon-ns-steps", type=int, default=5)
+    parser.add_argument("--gate-adamw", action="store_true", help="Update small gate tensors (ve_gate, w_attn_gate) with AdamW instead of Muon")
     parser.add_argument("--max-steps", type=int, default=None, help="Max steps for this session")
     parser.add_argument("--max-hours", type=float, default=8.5, help="Graceful exit wall-clock cap in hours")
     parser.add_argument("--log-every", type=int, default=10)
@@ -780,7 +784,11 @@ def main() -> None:
     # Validate dataset / mix string immediately before allocating accelerators
     parse_dataset_mix(args.dataset)
 
-    arch_overrides = json.loads(Path(args.arch_config).read_text(encoding="utf-8")) if args.arch_config else {}
+    if args.arch_config:
+        raw_arch = args.arch_config.strip()
+        arch_overrides = json.loads(raw_arch) if raw_arch.startswith("{") else json.loads(Path(raw_arch).read_text(encoding="utf-8"))
+    else:
+        arch_overrides = {}
     if args.remat_policy is not None:
         arch_overrides["remat_policy"] = args.remat_policy
     if args.attn_impl is not None:
@@ -808,10 +816,14 @@ def main() -> None:
         param_dtype=args.param_dtype,
         opt_dtype=args.opt_dtype,
         muon_vmap=args.muon_vmap,
+        gate_adamw=args.gate_adamw,
         use_fsdp=not args.no_fsdp,
         matrix_lr=args.matrix_lr,
         embedding_lr=args.embedding_lr,
+        unembedding_lr=args.unembedding_lr,
+        scalar_lr=args.scalar_lr,
         weight_decay=args.weight_decay,
+        muon_ns_steps=args.muon_ns_steps,
         wsd_phase=args.phase,
         warmup_steps=args.warmup_steps,
         decay_steps=args.decay_steps,
