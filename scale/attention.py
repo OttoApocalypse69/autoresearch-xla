@@ -15,6 +15,7 @@ Critical numerical invariants verified:
 
 from __future__ import annotations
 
+import functools
 import inspect
 from typing import Optional
 
@@ -38,6 +39,34 @@ def _is_ampere_or_newer_gpu(device_kind: str) -> bool:
     return True
 
 
+@functools.lru_cache(maxsize=1)
+def _probe_pallas_tpu_supported() -> bool:
+    """
+    Verify Pallas TPU Mosaic lowering works against the installed libtpu (0-HBM `.lower()` probe).
+    Catches Kaggle TPU v5e-8 images that ship newer JAX (e.g. 0.11) with an older bundled libtpu.
+    """
+    try:
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas.ops.tpu import splash_attention  # noqa: F401
+
+        def _noop_kernel(x_ref, o_ref):
+            o_ref[...] = x_ref[...]
+
+        spec = jax.ShapeDtypeStruct((8, 128), jnp.float32)
+        fn = pl.pallas_call(_noop_kernel, out_shape=spec)
+        jax.jit(fn).lower(spec)
+        return True
+    except Exception as exc:
+        first_line = str(exc).splitlines()[0] if str(exc) else repr(exc)
+        print(
+            f"[Attention] WARNING: Pallas TPU SplashAttention unavailable ({first_line}). "
+            "Falling back to XLA attention. On Kaggle TPU v5e-8, match JAX to Kaggle's bundled libtpu "
+            "(e.g. `pip install -q jax==0.6.2 jaxlib==0.6.2`) or upgrade `libtpu` to unlock SplashAttention!",
+            flush=True,
+        )
+        return False
+
+
 def resolve_attn_backend(requested: str = "auto") -> str:
     """Choose fastest numerically exact attention backend for the active JAX platform."""
     if requested != "auto":
@@ -45,12 +74,7 @@ def resolve_attn_backend(requested: str = "auto") -> str:
     dev0 = jax.devices()[0]
     platform = str(dev0.platform).lower()
     if platform == "tpu":
-        try:
-            from jax.experimental.pallas.ops.tpu import splash_attention  # noqa: F401
-
-            return "splash"
-        except Exception:
-            return "xla"
+        return "splash" if _probe_pallas_tpu_supported() else "xla"
     if platform == "gpu":
         kind = str(getattr(dev0, "device_kind", ""))
         return "cudnn" if _is_ampere_or_newer_gpu(kind) else "xla"
