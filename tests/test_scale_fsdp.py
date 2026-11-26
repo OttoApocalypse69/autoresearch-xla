@@ -47,7 +47,7 @@ from scale.optimizer import compute_weight_decay, compute_wsd_lrm  # noqa: E402
         ("350m", 340_000_000, 390_000_000),
         ("1b", 1_000_000_000, 1_060_000_000),
         ("1b-relu2", 1_000_000_000, 1_050_000_000),
-        ("1b-ve", 1_350_000_000, 1_400_000_000),
+        ("1b-ve", 1_420_000_000, 1_490_000_000),
     ],
 )
 def test_preset_exact_param_counts(preset, min_params, max_params):
@@ -564,12 +564,16 @@ for qmode in ("int8", "int8-all", "fp8"):
 
 
 def test_round2_unet_ve_stride_single_chunk_fsdp():
-    """Verify Round-3 Quad-Crown preset (1b-ve) and 8-device FSDP training with U-Net skips, ve_stride=2, attn_gate, smear, v0_residual, qk_gain, SSSL, and single-chunk INT8 loss."""
+    """Verify Round-4 Final Boss preset (1b-ve), strict causality, and 8-device FSDP training with U-Net skips, ve_stride=2, full VE gate, elementwise attn_gate, per-channel smear, Canon-A/C, v0_residual, qk_gain, SSSL, and single-chunk INT8 loss."""
     spec_1b_ve = get_model_preset("1b-ve")
     assert spec_1b_ve.use_value_embeds is True
+    assert spec_1b_ve.ve_gate_full is True
     assert spec_1b_ve.use_unet_skip is True
     assert spec_1b_ve.use_attn_gate is True
+    assert spec_1b_ve.attn_gate_mode == "elementwise"
     assert spec_1b_ve.use_smear is True
+    assert spec_1b_ve.smear_channels is True
+    assert spec_1b_ve.use_canon is True
     assert spec_1b_ve.use_v0_residual is True
     assert spec_1b_ve.use_qk_gain is True
     assert spec_1b_ve.window_pattern == "SSSL"
@@ -582,21 +586,25 @@ import jax, jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 from scale.config import TrainConfig, get_model_preset
 from scale.fsdp import build_tree_shardings, create_fsdp_mesh, shard_pytree
-from scale.model import count_params, forward_scalar_loss_and_z, init_params, precompute_rotary_embeddings
+from scale.model import count_params, forward_logits, forward_scalar_loss_and_z, init_params, precompute_rotary_embeddings
 from scale.optimizer import init_opt_state, optimizer_step
 from scale.quant import prequantize_model_weights
 
 mesh = create_fsdp_mesh()
 assert mesh.size == 8
 
-# Test both ve_stride=1 and ve_stride=2 with full Round-3 Quad-Crown + U-Net skips + SSSL + single-chunk loss
+# Test both ve_stride=1 and ve_stride=2 with full Round-4 Final Boss + U-Net skips + SSSL + single-chunk INT8 loss
 common_ov = {
     "n_layer": 8,
     "window_pattern": "SSSL",
     "use_value_embeds": True,
+    "ve_gate_full": True,
     "use_unet_skip": True,
     "use_attn_gate": True,
+    "attn_gate_mode": "elementwise",
     "use_smear": True,
+    "smear_channels": True,
+    "use_canon": True,
     "use_v0_residual": True,
     "use_qk_gain": True,
     "rope_base": 50000.0,
@@ -612,9 +620,31 @@ p_half = init_params(jax.random.PRNGKey(0), spec_half, param_dtype=jnp.bfloat16)
 assert p_full["value_embeds"].shape[0] == 8
 assert p_half["value_embeds"].shape[0] == 4
 assert count_params(p_half)["total"] < count_params(p_full)["total"]
-for k in ("unet_lambdas", "qk_gain", "v0_lambdas", "smear_gate", "smear_lambda"):
-    assert k in p_half
-assert "w_attn_gate" in p_half["blocks"]
+for k in ("unet_lambdas", "qk_gain", "v0_lambdas", "smear_gate", "smear_lambda", "smear_lambda2", "canon_a", "canon_c"):
+    assert k in p_half, f"Missing param {k}"
+assert p_half["blocks"]["w_attn_gate"].shape == (8, spec_half.n_embd, spec_half.n_embd)
+assert p_half["blocks"]["ve_gate"].shape == (8, spec_half.n_embd, spec_half.n_kv_head)
+
+# Strict causality verification with nonzero random Canon-A/C, smear, U-Net skips, and elementwise gate!
+p_caus = init_params(jax.random.PRNGKey(1), spec_half, param_dtype=jnp.float32)
+p_caus = dict(p_caus)
+for ck in ("canon_a", "canon_c", "smear_gate", "smear_lambda", "smear_lambda2", "unet_lambdas", "v0_lambdas"):
+    p_caus[ck] = jax.random.normal(jax.random.PRNGKey(hash(ck) & 0xFFFF), p_caus[ck].shape, jnp.float32) * 0.25
+p_caus["blocks"] = dict(p_caus["blocks"])
+for bk in ("w_attn_gate", "ve_gate", "c_proj", "mlp_down"):
+    p_caus["blocks"][bk] = jax.random.normal(jax.random.PRNGKey(hash(bk) & 0xFFFF), p_caus["blocks"][bk].shape, jnp.float32) * 0.1
+cos_c, sin_c = precompute_rotary_embeddings(spec_half.sequence_len, spec_half.head_dim, base=spec_half.rope_base)
+x_a = jax.random.randint(jax.random.PRNGKey(99), (1, spec_half.sequence_len), 0, spec_half.vocab_size)
+split_pos = 20
+x_b = x_a.at[:, split_pos:].set((x_a[:, split_pos:] + 7) % spec_half.vocab_size)
+spec_eval = get_model_preset("smoke", arch_overrides={**common_ov, "ve_stride": 2, "attn_impl": "xla", "matmul_quant": "none", "remat_policy": "none"})
+logits_a = forward_logits(p_caus, x_a, cos_c, sin_c, spec_eval, jnp.float32)
+logits_b = forward_logits(p_caus, x_b, cos_c, sin_c, spec_eval, jnp.float32)
+max_prefix_diff = float(jnp.max(jnp.abs(logits_a[:, :split_pos] - logits_b[:, :split_pos])))
+max_suffix_diff = float(jnp.max(jnp.abs(logits_a[:, split_pos:] - logits_b[:, split_pos:])))
+assert max_prefix_diff < 1e-6, f"CAUSALITY LEAK! max_prefix_diff={max_prefix_diff}"
+assert max_suffix_diff > 1e-3, f"Suffix unexpectedly identical: {max_suffix_diff}"
+print(f"Strict causality OK: max_prefix_diff={max_prefix_diff:.3e}, max_suffix_diff={max_suffix_diff:.3e}")
 
 tcfg = TrainConfig(
     total_batch_size=2048,
@@ -656,8 +686,8 @@ for _ in range(3):
     params, opt_state, ce, gnorm = step_fn(params, opt_state)
     assert np.isfinite(float(ce)) and np.isfinite(float(gnorm))
     losses.append(float(ce))
-assert losses[-1] < losses[0], f"Round-3 Quad-Crown 8-dev FSDP loss did not decrease: {losses}"
-print(f"Round-3 Quad-Crown 8-dev FSDP OK: losses={losses}")
+assert losses[-1] < losses[0], f"Round-4 Final Boss 8-dev FSDP loss did not decrease: {losses}"
+print(f"Round-4 Final Boss 8-dev FSDP OK: losses={losses}")
 """
     res = subprocess.run(
         [PYTHON, "-c", code],
@@ -666,6 +696,6 @@ print(f"Round-3 Quad-Crown 8-dev FSDP OK: losses={losses}")
         capture_output=True,
         text=True,
     )
-    assert res.returncode == 0, f"Round-3 Quad-Crown 8-dev FSDP test failed:\n{res.stdout}\n{res.stderr}"
+    assert res.returncode == 0, f"Round-4 Final Boss 8-dev FSDP test failed:\n{res.stdout}\n{res.stderr}"
 
 

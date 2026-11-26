@@ -31,9 +31,13 @@ class ModelSpec:
     use_qk_gain: bool = False        # Learnable per-head QK-norm gain (frees unit-RMS attention temperature)
     use_value_embeds: bool = False   # ResFormer value embeddings (alternating/periodic)
     ve_stride: int = 1               # 1=every layer, 2=alternating layers (halves VE params & HBM!)
+    ve_gate_full: bool = False       # Read full C channels (vs first 32) for ve_gate
     use_v0_residual: bool = False    # ResFormer layer-0 value residual (v += lam * v0; zero extra GEMMs)
-    use_attn_gate: bool = False      # Qwen3/NeurIPS'25 headwise SDPA output sigmoid gate (kills sinks & outliers)
-    use_smear: bool = False          # Modded-nanogpt 1-token learned bigram smear after wte (13 params!)
+    use_attn_gate: bool = False      # Qwen3/NeurIPS'25 SDPA output sigmoid gate (kills sinks & outliers)
+    attn_gate_mode: str = "headwise" # "headwise" (C->n_head, ~0% FLOPs) | "elementwise" (C->C, fused INT8)
+    use_smear: bool = False          # Modded-nanogpt learned token smear after wte
+    smear_channels: bool = False     # Per-channel bigram+trigram smear (vs 13-float scalar bigram)
+    use_canon: bool = False          # Allen-Zhu (2025) Canon-A + Canon-C causal k=4 depthwise conv per layer
     use_resid_lambdas: bool = True   # Per-layer residual + x0 skip scalars (nanochat)
     use_unet_skip: bool = False      # Modded-nanogpt symmetric encoder->decoder U-Net skip connections
     tie_embeddings: bool = False     # Tie wte & lm_head weights
@@ -53,6 +57,7 @@ class ModelSpec:
         assert self.n_head % self.n_kv_head == 0, f"n_head ({self.n_head}) must be divisible by n_kv_head ({self.n_kv_head})"
         assert self.activation in ("swiglu", "relu2", "gelu"), f"Unsupported activation: {self.activation!r}"
         assert all(c in "SL" for c in self.window_pattern.upper()), f"Invalid window_pattern: {self.window_pattern!r}"
+        assert self.attn_gate_mode in ("headwise", "elementwise"), f"Invalid attn_gate_mode: {self.attn_gate_mode!r}"
         valid_remat = ("none", "save_all_compute", "save_attn", "save_qkv_attn", "dots_with_no_batch_dims", "dots", "full")
         assert self.remat_policy in valid_remat, f"Invalid remat_policy: {self.remat_policy!r}"
         assert self.attn_impl in ("auto", "splash", "cudnn", "xla"), f"Invalid attn_impl: {self.attn_impl!r}"
@@ -165,9 +170,9 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         remat_policy="save_attn",
         loss_chunk_size=2048,
     ),
-    # ~1.37B total / 1.036B active-FLOPs Round-3 Quad-Crown autoresearch champion (-0.1409 BPB on live mix-1b!):
-    # Value Embeddings + SSSL window + U-Net skips + Qwen3 Gated Attention + 13-float Bigram Smear +
-    # ResFormer v0 residual + gentle QK-norm gain + RoPE 50k + z_loss 5e-4.
+    # ~1.456B total / 1.120B active Round-4 Final Boss autoresearch champion (-0.2310 BPB on live mix-1b: 1.7867 -> 1.5557!):
+    # Value Embeddings (full VE gate) + SSSL window + U-Net skips + Qwen3 Elementwise Gated Attention (INT8 MXU) +
+    # Per-channel Bigram+Trigram Smear + Allen-Zhu Canon-A/C conv4 + ResFormer v0 residual + gentle QK-norm gain + RoPE 50k + z_loss 5e-4.
     # Recommended optimizer flags: --matrix-lr 0.06 --embedding-lr 0.5 --weight-decay 0.03
     "1b-ve": ModelSpec(
         sequence_len=2048,
@@ -181,9 +186,13 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         window_pattern="SSSL",
         use_qk_gain=True,
         use_value_embeds=True,
+        ve_gate_full=True,
         use_v0_residual=True,
         use_attn_gate=True,
+        attn_gate_mode="elementwise",
         use_smear=True,
+        smear_channels=True,
+        use_canon=True,
         use_unet_skip=True,
         rope_base=50000.0,
         z_loss_weight=5e-4,

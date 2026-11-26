@@ -60,6 +60,16 @@ def apply_rotary_emb(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
     return jnp.concatenate([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], axis=-1)
 
 
+def _apply_canon_conv4(h: jax.Array, w: jax.Array) -> jax.Array:
+    """Allen-Zhu (2025) Canon causal k=4 depthwise conv via 3 VPU-fused shifted FMAs (zero GEMMs!)."""
+    wc = w.astype(h.dtype)
+    z1 = jnp.zeros_like(h[:, :1])
+    h1 = jnp.concatenate([z1, h[:, :-1]], axis=1)
+    h2 = jnp.concatenate([jnp.zeros_like(h[:, :2]), h[:, :-2]], axis=1)
+    h3 = jnp.concatenate([jnp.zeros_like(h[:, :3]), h[:, :-3]], axis=1)
+    return h + h1 * wc[0] + h2 * wc[1] + h3 * wc[2]
+
+
 def init_params(key: jax.Array, spec: ModelSpec, param_dtype=jnp.float32) -> dict:
     """
     Initialize parameters in `param_dtype` (`float32` standard or `bfloat16` for pure-BF16 +
@@ -71,7 +81,7 @@ def init_params(key: jax.Array, spec: ModelSpec, param_dtype=jnp.float32) -> dic
     kv_dim = spec.kv_dim
     qkv_dim = C + 2 * kv_dim
     M = spec.mlp_hidden
-    ve_ch = min(32, C)
+    ve_ch = C if spec.ve_gate_full else min(32, C)
     s = (3.0**0.5) * (C**-0.5)
 
     def next_key():
@@ -92,7 +102,8 @@ def init_params(key: jax.Array, spec: ModelSpec, param_dtype=jnp.float32) -> dic
     if spec.use_value_embeds:
         blocks["ve_gate"] = jnp.zeros((L, ve_ch, spec.n_kv_head), dtype=param_dtype)
     if spec.use_attn_gate:
-        blocks["w_attn_gate"] = jnp.zeros((L, C, spec.n_head), dtype=param_dtype)
+        gate_out = C if spec.attn_gate_mode == "elementwise" else spec.n_head
+        blocks["w_attn_gate"] = jnp.zeros((L, C, gate_out), dtype=param_dtype)
 
     params: dict = {
         "wte": (
@@ -119,8 +130,16 @@ def init_params(key: jax.Array, spec: ModelSpec, param_dtype=jnp.float32) -> dic
     if spec.use_v0_residual:
         params["v0_lambdas"] = jnp.zeros((L,), dtype=jnp.float32)
     if spec.use_smear:
-        params["smear_gate"] = jnp.zeros((min(12, C), 1), dtype=jnp.float32)
-        params["smear_lambda"] = jnp.array(0.0, dtype=jnp.float32)
+        if spec.smear_channels:
+            params["smear_gate"] = jnp.zeros((min(12, C), 2), dtype=jnp.float32)
+            params["smear_lambda"] = jnp.zeros((C,), dtype=jnp.float32)
+            params["smear_lambda2"] = jnp.zeros((C,), dtype=jnp.float32)
+        else:
+            params["smear_gate"] = jnp.zeros((min(12, C), 1), dtype=jnp.float32)
+            params["smear_lambda"] = jnp.array(0.0, dtype=jnp.float32)
+    if spec.use_canon:
+        params["canon_a"] = jnp.zeros((L, 3, C), dtype=jnp.float32)
+        params["canon_c"] = jnp.zeros((L, 3, C), dtype=jnp.float32)
     return params
 
 
@@ -156,8 +175,7 @@ def _pre_attn_subblock(
     x0: jax.Array,
     ve_tok: Optional[jax.Array],
     v0: Optional[jax.Array],
-    v0_lam: Optional[jax.Array],
-    qk_gain: Optional[jax.Array],
+    extras: dict,
     cos: jax.Array,
     sin: jax.Array,
     spec: ModelSpec,
@@ -167,13 +185,15 @@ def _pre_attn_subblock(
     B, T, C = x.shape
     head_dim = spec.head_dim
     kv_dim = spec.kv_dim
-    ve_ch = min(32, C)
+    ve_ch = C if spec.ve_gate_full else min(32, C)
     qmode = spec.matmul_quant
 
     if spec.use_resid_lambdas:
         x = resid_lam.astype(compute_dtype) * x + x0_lam.astype(compute_dtype) * x0
 
     h = rms_norm(x)
+    if "canon_a" in extras:
+        h = _apply_canon_conv4(h, extras["canon_a"])
     qw_qkv = q_blk["w_qkv"] if (q_blk is not None and "w_qkv" in q_blk) else None
     qkv = qdot(h.reshape(B * T, C), blk["w_qkv"].astype(compute_dtype), mode=qmode, q_weight=qw_qkv, mesh=mesh)
     qkv = checkpoint_name(qkv, "qkv")
@@ -186,22 +206,33 @@ def _pre_attn_subblock(
         gate = 2.0 * jax.nn.sigmoid(jnp.dot(h[..., :ve_ch], blk["ve_gate"].astype(compute_dtype)))
         v = v + gate[..., None] * ve_h
 
-    if v0 is not None and v0_lam is not None:
-        v = v + v0_lam.astype(compute_dtype) * v0
+    if v0 is not None and "v0_lam" in extras:
+        v = v + extras["v0_lam"].astype(compute_dtype) * v0
 
     q = apply_rotary_emb(q, cos, sin)
     k = apply_rotary_emb(k, cos, sin)
     if spec.use_qk_norm:
         q = rms_norm(q)
         k = rms_norm(k)
-    if qk_gain is not None:
-        q = q * qk_gain.astype(compute_dtype)[None, None, :, None]
+    if "qk_gain" in extras:
+        q = q * extras["qk_gain"].astype(compute_dtype)[None, None, :, None]
 
     attn_gate = None
     if spec.use_attn_gate and "w_attn_gate" in blk:
-        attn_gate = jax.nn.sigmoid(
-            jnp.dot(h, blk["w_attn_gate"].astype(compute_dtype)) + jnp.asarray(1.0, compute_dtype)
-        )
+        if spec.attn_gate_mode == "elementwise":
+            qw_ag = q_blk["w_attn_gate"] if (q_blk is not None and "w_attn_gate" in q_blk) else None
+            ag_lin = qdot(
+                h.reshape(B * T, C),
+                blk["w_attn_gate"].astype(compute_dtype),
+                mode=qmode,
+                q_weight=qw_ag,
+                mesh=mesh,
+            ).reshape(B, T, spec.n_head, head_dim)
+            attn_gate = jax.nn.sigmoid(ag_lin + jnp.asarray(1.0, compute_dtype))
+        else:
+            attn_gate = jax.nn.sigmoid(
+                jnp.dot(h, blk["w_attn_gate"].astype(compute_dtype)) + jnp.asarray(1.0, compute_dtype)
+            )
     return q, k, v, attn_gate
 
 
@@ -213,6 +244,7 @@ def _post_attn_mlp_subblock(
     x: jax.Array,
     x0: jax.Array,
     y: jax.Array,
+    extras: dict,
     spec: ModelSpec,
     compute_dtype,
     mesh: Optional[Mesh] = None,
@@ -227,7 +259,10 @@ def _post_attn_mlp_subblock(
     y_out = checkpoint_name(y_out, "out_proj")
     x = x + y_out
 
-    m = rms_norm(x).reshape(B * T, C)
+    m_h = rms_norm(x)
+    if "canon_c" in extras:
+        m_h = _apply_canon_conv4(m_h, extras["canon_c"])
+    m = m_h.reshape(B * T, C)
     if spec.activation == "swiglu":
         qw_gu = q_blk["w_gate_up"] if (q_blk is not None and "w_gate_up" in q_blk) else None
         gu = checkpoint_name(qdot(m, blk["w_gate_up"].astype(compute_dtype), mode=qmode, q_weight=qw_gu, mesh=mesh), "mlp_wi")
@@ -256,8 +291,7 @@ def _apply_single_layer(
     x0: jax.Array,
     ve_tok: Optional[jax.Array],
     v0: Optional[jax.Array],
-    v0_lam: Optional[jax.Array],
-    qk_gain: Optional[jax.Array],
+    extras: dict,
     cos: jax.Array,
     sin: jax.Array,
     spec: ModelSpec,
@@ -266,7 +300,7 @@ def _apply_single_layer(
     mesh: Optional[Mesh],
 ) -> jax.Array:
     q, k, v, attn_gate = _pre_attn_subblock(
-        blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, v0, v0_lam, qk_gain, cos, sin, spec, compute_dtype, mesh=mesh
+        blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, v0, extras, cos, sin, spec, compute_dtype, mesh=mesh
     )
     y = fused_causal_attention(
         q,
@@ -278,9 +312,9 @@ def _apply_single_layer(
         mesh=mesh,
     )
     if attn_gate is not None:
-        y = y * attn_gate[..., None]
+        y = y * (attn_gate if attn_gate.ndim == 4 else attn_gate[..., None])
     y = checkpoint_name(y, "context")
-    return _post_attn_mlp_subblock(blk, q_blk, resid_lam, x0_lam, x, x0, y, spec, compute_dtype, mesh=mesh)
+    return _post_attn_mlp_subblock(blk, q_blk, resid_lam, x0_lam, x, x0, y, extras, spec, compute_dtype, mesh=mesh)
 
 
 def _make_layer_fn(
@@ -310,8 +344,8 @@ def _make_layer_fn(
             policy=post_pol,
         )
 
-        def split_layer(blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, v0, v0_lam, qk_gain, cos, sin):
-            q, k, v, attn_gate = pre_fn(blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, v0, v0_lam, qk_gain, cos, sin)
+        def split_layer(blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, v0, extras, cos, sin):
+            q, k, v, attn_gate = pre_fn(blk, q_blk, resid_lam, x0_lam, x, x0, ve_tok, v0, extras, cos, sin)
             y = fused_causal_attention(
                 q,
                 k,
@@ -322,8 +356,8 @@ def _make_layer_fn(
                 mesh=mesh,
             )
             if attn_gate is not None:
-                y = y * attn_gate[..., None]
-            return post_fn(blk, q_blk, resid_lam, x0_lam, x, x0, y)
+                y = y * (attn_gate if attn_gate.ndim == 4 else attn_gate[..., None])
+            return post_fn(blk, q_blk, resid_lam, x0_lam, x, x0, y, extras)
 
         return split_layer
 
@@ -363,18 +397,30 @@ def forward_hidden(
     if spec.use_smear and "smear_gate" in params:
         sm_ch = min(12, spec.n_embd)
         sm_gate = jax.nn.sigmoid(jnp.dot(x[..., :sm_ch], params["smear_gate"].astype(compute_dtype)))
-        x_prev = jnp.concatenate([jnp.zeros_like(x[:, :1]), x[:, :-1]], axis=1)
-        x = rms_norm(x + (params["smear_lambda"].astype(compute_dtype) * sm_gate) * x_prev)
+        x_prev1 = jnp.concatenate([jnp.zeros_like(x[:, :1]), x[:, :-1]], axis=1)
+        if spec.smear_channels and "smear_lambda2" in params:
+            x_prev2 = jnp.concatenate([jnp.zeros_like(x[:, :2]), x[:, :-2]], axis=1)
+            lam1 = params["smear_lambda"].astype(compute_dtype)[None, None, :]
+            lam2 = params["smear_lambda2"].astype(compute_dtype)[None, None, :]
+            x = rms_norm(x + (lam1 * sm_gate[..., 0:1]) * x_prev1 + (lam2 * sm_gate[..., 1:2]) * x_prev2)
+        else:
+            x = rms_norm(x + (params["smear_lambda"].astype(compute_dtype) * sm_gate) * x_prev1)
     x0 = x
 
     v0 = None
-    v0_lams = params.get("v0_lambdas", None) if spec.use_v0_residual else None
-    if v0_lams is not None:
+    if spec.use_v0_residual and "v0_lambdas" in params:
         B_cur, T_cur, C_cur = x0.shape
         w_v0 = params["blocks"]["w_qkv"][0, :, C_cur + spec.kv_dim :].astype(compute_dtype)
         v0 = jnp.dot(x0.reshape(B_cur * T_cur, C_cur), w_v0).reshape(B_cur, T_cur, spec.n_kv_head, spec.head_dim)
 
-    qk_gains = params.get("qk_gain", None) if spec.use_qk_gain else None
+    layer_extras: dict[str, jax.Array] = {}
+    if spec.use_v0_residual and "v0_lambdas" in params:
+        layer_extras["v0_lam"] = params["v0_lambdas"]
+    if spec.use_qk_gain and "qk_gain" in params:
+        layer_extras["qk_gain"] = params["qk_gain"]
+    if spec.use_canon and "canon_a" in params:
+        layer_extras["canon_a"] = params["canon_a"]
+        layer_extras["canon_c"] = params["canon_c"]
 
     pattern = spec.window_pattern.upper()
     ve_table = params.get("value_embeds", None)
@@ -401,15 +447,14 @@ def forward_hidden(
         grouped_q = jax.tree_util.tree_map(reshape_group, q_scan)
         grouped_r = reshape_group(params["resid_lambdas"])
         grouped_x0 = reshape_group(params["x0_lambdas"])
-        grouped_v0l = reshape_group(v0_lams) if v0_lams is not None else None
-        grouped_qkg = reshape_group(qk_gains) if qk_gains is not None else None
+        grouped_ex = jax.tree_util.tree_map(reshape_group, layer_extras)
         if ve_table is not None:
             ve_per_grp = G // ve_stride
             grouped_ve = ve_table.reshape((n_groups, ve_per_grp) + ve_table.shape[1:])
         else:
             grouped_ve = None
 
-        def _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg, g_skip_lams=None, g_skips=None):
+        def _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_ex, g_skip_lams=None, g_skips=None):
             cur = carry_x
             outs = []
             for g in range(G):
@@ -418,9 +463,8 @@ def forward_hidden(
                 blk_g = jax.tree_util.tree_map(lambda a: a[g], g_blk)
                 qb_g = jax.tree_util.tree_map(lambda a: a[g], g_qb) if g_qb else None
                 ve_tok = g_ve[g // ve_stride][idx] if (g_ve is not None and g % ve_stride == 0) else None
-                v0_l = g_v0l[g] if g_v0l is not None else None
-                qk_g = g_qkg[g] if g_qkg is not None else None
-                cur = group_fns[g](blk_g, qb_g, g_r[g], g_x0[g], cur, x0, ve_tok, v0, v0_l, qk_g, cos_t, sin_t)
+                ex_g = jax.tree_util.tree_map(lambda a: a[g], g_ex)
+                cur = group_fns[g](blk_g, qb_g, g_r[g], g_x0[g], cur, x0, ve_tok, v0, ex_g, cos_t, sin_t)
                 outs.append(cur)
             return cur, outs
 
@@ -433,8 +477,8 @@ def forward_hidden(
             n_skip = enc_g * G
 
             def enc_body(carry_x, grp):
-                g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg = grp
-                cur, outs = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg)
+                g_blk, g_qb, g_r, g_x0, g_ve, g_ex = grp
+                cur, outs = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_ex)
                 return cur, jnp.stack(outs, axis=0)
 
             enc_in = (
@@ -443,8 +487,7 @@ def forward_hidden(
                 grouped_r[:enc_g],
                 grouped_x0[:enc_g],
                 grouped_ve[:enc_g] if grouped_ve is not None else None,
-                grouped_v0l[:enc_g] if grouped_v0l is not None else None,
-                grouped_qkg[:enc_g] if grouped_qkg is not None else None,
+                _slice_grp(grouped_ex, 0, enc_g),
             )
             x, enc_skips = jax.lax.scan(enc_body, x, enc_in, unroll=spec.scan_unroll)
             # Reverse encoder layer outputs so decoder layer (L-1-i) pairs with encoder layer i
@@ -454,8 +497,8 @@ def forward_hidden(
 
             if dec_start > enc_g:
                 def mid_body(carry_x, grp):
-                    g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg = grp
-                    cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg)
+                    g_blk, g_qb, g_r, g_x0, g_ve, g_ex = grp
+                    cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_ex)
                     return cur, None
 
                 mid_in = (
@@ -464,14 +507,13 @@ def forward_hidden(
                     grouped_r[enc_g:dec_start],
                     grouped_x0[enc_g:dec_start],
                     grouped_ve[enc_g:dec_start] if grouped_ve is not None else None,
-                    grouped_v0l[enc_g:dec_start] if grouped_v0l is not None else None,
-                    grouped_qkg[enc_g:dec_start] if grouped_qkg is not None else None,
+                    _slice_grp(grouped_ex, enc_g, dec_start),
                 )
                 x, _ = jax.lax.scan(mid_body, x, mid_in, unroll=spec.scan_unroll)
 
             def dec_body(carry_x, grp):
-                g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg, g_ul, g_sk = grp
-                cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg, g_ul, g_sk)
+                g_blk, g_qb, g_r, g_x0, g_ve, g_ex, g_ul, g_sk = grp
+                cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_ex, g_ul, g_sk)
                 return cur, None
 
             dec_in = (
@@ -480,22 +522,21 @@ def forward_hidden(
                 grouped_r[dec_start:n_groups],
                 grouped_x0[dec_start:n_groups],
                 grouped_ve[dec_start:n_groups] if grouped_ve is not None else None,
-                grouped_v0l[dec_start:n_groups] if grouped_v0l is not None else None,
-                grouped_qkg[dec_start:n_groups] if grouped_qkg is not None else None,
+                _slice_grp(grouped_ex, dec_start, n_groups),
                 dec_lams,
                 dec_skips,
             )
             x, _ = jax.lax.scan(dec_body, x, dec_in, unroll=spec.scan_unroll)
         else:
             def std_body(carry_x, grp):
-                g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg = grp
-                cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_v0l, g_qkg)
+                g_blk, g_qb, g_r, g_x0, g_ve, g_ex = grp
+                cur, _ = _exec_group(carry_x, g_blk, g_qb, g_r, g_x0, g_ve, g_ex)
                 return cur, None
 
             x, _ = jax.lax.scan(
                 std_body,
                 x,
-                (grouped_blocks, grouped_q, grouped_r, grouped_x0, grouped_ve, grouped_v0l, grouped_qkg),
+                (grouped_blocks, grouped_q, grouped_r, grouped_x0, grouped_ve, grouped_ex),
                 unroll=spec.scan_unroll,
             )
 
@@ -512,9 +553,8 @@ def forward_hidden(
             blk_i = jax.tree_util.tree_map(lambda a: a[i], params["blocks"])
             qb_i = jax.tree_util.tree_map(lambda a: a[i], q_blocks) if q_blocks is not None else None
             ve_tok = ve_table[i // ve_stride][idx] if (ve_table is not None and i % ve_stride == 0) else None
-            v0_l = v0_lams[i] if v0_lams is not None else None
-            qk_g = qk_gains[i] if qk_gains is not None else None
-            x = layer_fn(blk_i, qb_i, params["resid_lambdas"][i], params["x0_lambdas"][i], x, x0, ve_tok, v0, v0_l, qk_g, cos_t, sin_t)
+            ex_i = jax.tree_util.tree_map(lambda a: a[i], layer_extras)
+            x = layer_fn(blk_i, qb_i, params["resid_lambdas"][i], params["x0_lambdas"][i], x, x0, ve_tok, v0, ex_i, cos_t, sin_t)
             if unet_lams is not None and i < half:
                 skips_list.append(x)
 
@@ -828,8 +868,8 @@ def count_params(params: dict) -> dict[str, int]:
     lm_head = int(params["lm_head"].size) if "lm_head" in params else 0
     ve = int(params["value_embeds"].size) if "value_embeds" in params else 0
     blocks = sum(int(a.size) for a in jax.tree_util.tree_leaves(params["blocks"]))
-    scalar_keys = ("resid_lambdas", "x0_lambdas", "unet_lambdas", "qk_gain", "v0_lambdas", "smear_gate", "smear_lambda")
-    scalars = sum(int(params[k].size) for k in scalar_keys if k in params)
+    known_non_scalar = {"wte", "lm_head", "value_embeds", "blocks"}
+    scalars = sum(int(v.size) for k, v in params.items() if k not in known_non_scalar)
     total = wte + lm_head + ve + blocks + scalars
     return {
         "wte": wte,
@@ -852,7 +892,7 @@ def estimate_flops_per_token(params: dict, spec: ModelSpec) -> float:
     attn_flops = 0.0
     for i in range(spec.n_layer):
         ch = "L" if i == spec.n_layer - 1 else pattern[i % len(pattern)]
-        eff_seq = t if ch == "L" else t // 2
+        eff_seq = t if ch == "L" else max(1, t // 2)
         attn_flops += 12.0 * spec.n_head * spec.head_dim * eff_seq
     return 6.0 * active_non_emb + attn_flops
 
@@ -871,7 +911,9 @@ def generate_tokens(
     """Autoregressive sampler for live qualitative checks during pretraining."""
     # Sampling runs at batch=1 -> use safe XLA attention regardless of Splash/cuDNN training kernel
     sample_spec = ModelSpec.from_dict({**spec.to_dict(), "attn_impl": "xla", "remat_policy": "none"})
-    cos, sin = precompute_rotary_embeddings(sample_spec.sequence_len, sample_spec.head_dim, base=sample_spec.rope_base)
+    cos, sin = precompute_rotary_embeddings(
+        sample_spec.sequence_len, sample_spec.head_dim, base=sample_spec.rope_base
+    )
     if batch_sharding is not None:
         from jax.sharding import NamedSharding, PartitionSpec as P
 

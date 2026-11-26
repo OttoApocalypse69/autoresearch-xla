@@ -24,7 +24,17 @@ POLAR_EXPRESS_COEFFS = (
 
 
 GATE_BLOCK_KEYS = ("ve_gate", "w_attn_gate")
-EXTRA_SCALAR_KEYS = ("unet_lambdas", "qk_gain", "v0_lambdas", "smear_gate", "smear_lambda")
+EXTRA_SCALAR_KEYS = (
+    "unet_lambdas",
+    "qk_gain",
+    "v0_lambdas",
+    "smear_gate",
+    "smear_lambda",
+    "smear_lambda2",
+    "canon_a",
+    "canon_c",
+)
+GENTLE_SCALAR_KEYS = ("qk_gain", "canon_a", "canon_c")
 
 
 def init_opt_state(params: dict, opt_dtype=jnp.float32, gate_adamw: bool = False) -> dict:
@@ -226,7 +236,7 @@ def optimizer_step(
     )
     for k in EXTRA_SCALAR_KEYS:
         if k in params:
-            k_lr = (tcfg.scalar_lr * 0.05 if k == "qk_gain" else tcfg.scalar_lr) * lrm
+            k_lr = (tcfg.scalar_lr * 0.05 if k in GENTLE_SCALAR_KEYS else tcfg.scalar_lr) * lrm
             new_params[k], new_state[k] = _adamw_update(
                 params[k], grads[k], opt_state[k], step_f,
                 k_lr, 0.96, 0.95, next_sr_key(),

@@ -104,6 +104,8 @@ def prequantize_model_weights(params: dict, mode: str, tie_embeddings: bool = Fa
     for k in LINEAR_BLOCK_KEYS:
         if k in blocks:
             q_blocks[k] = prequantize_weight_pair(blocks[k], mode)
+    if "w_attn_gate" in blocks and blocks["w_attn_gate"].shape[-1] >= 128:
+        q_blocks["w_attn_gate"] = prequantize_weight_pair(blocks["w_attn_gate"], mode)
 
     q_cache = {"blocks": q_blocks}
     if mode == "int8-all":
