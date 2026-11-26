@@ -140,6 +140,14 @@ def init_params(key: jax.Array, spec: ModelSpec, param_dtype=jnp.float32) -> dic
     if spec.use_canon:
         params["canon_a"] = jnp.zeros((L, 3, C), dtype=jnp.float32)
         params["canon_c"] = jnp.zeros((L, 3, C), dtype=jnp.float32)
+    if spec.mtp_weight > 0.0:
+        s_2c = (3.0**0.5) * ((2 * C) ** -0.5)
+        params["mtp_blocks"] = {
+            "mtp_proj": jax.random.uniform(next_key(), (1, 2 * C, C), jnp.float32, -s_2c, s_2c).astype(param_dtype),
+            "w_gate_up": jax.random.uniform(next_key(), (1, C, 2 * M), jnp.float32, -s, s).astype(param_dtype),
+            "mlp_down": jnp.zeros((1, M, C), dtype=param_dtype),
+        }
+        params["mtp_canon"] = jnp.zeros((3, C), dtype=jnp.float32)
     return params
 
 
@@ -760,6 +768,149 @@ def _make_fused_chunked_loss_int8_bwd_fn(softcap: float, z_loss_weight: float, m
     return _fused_loss
 
 
+def _make_fused_masked_ce_fn(softcap: float):
+    """Single-pass masked Cut-Cross-Entropy for Multi-Token Prediction (`mask_ch` zeros out final token)."""
+    def _chunk_nll_sum(xc, w, yc, mc, inv_valid):
+        nll_c, _ = _chunk_ce_and_z(xc, yc, w, softcap)
+        return jnp.sum(nll_c * mc, dtype=jnp.float32) * inv_valid
+
+    chunk_vg = jax.value_and_grad(_chunk_nll_sum, argnums=(0, 1))
+
+    @jax.custom_vjp
+    def _fused(x_ch, lm_w, y_ch, m_ch, scale):
+        inv_valid = scale / jnp.maximum(jnp.sum(m_ch, dtype=jnp.float32), jnp.float32(1.0))
+
+        def fwd_body(acc, triple):
+            xc, yc, mc = triple
+            nll_c, _ = _chunk_ce_and_z(xc, yc, lm_w, softcap)
+            return acc + jnp.sum(nll_c * mc, dtype=jnp.float32) * inv_valid, None
+
+        tot, _ = jax.lax.scan(fwd_body, jnp.float32(0.0), (x_ch, y_ch, m_ch))
+        return tot
+
+    def _fwd(x_ch, lm_w, y_ch, m_ch, scale):
+        inv_valid = scale / jnp.maximum(jnp.sum(m_ch, dtype=jnp.float32), jnp.float32(1.0))
+        dw_acc_dtype = jnp.float32 if lm_w.dtype == jnp.float16 else lm_w.dtype
+        dw_init = jnp.zeros_like(lm_w, dtype=dw_acc_dtype)
+
+        def scan_body(carry, triple):
+            tot_acc, dw_acc = carry
+            xc, yc, mc = triple
+            tot_c, (dx_c, dw_c) = chunk_vg(xc, lm_w, yc, mc, inv_valid)
+            return (tot_acc + tot_c, dw_acc + dw_c.astype(dw_acc_dtype)), dx_c
+
+        (tot_sum, dw_sum), dx_chunks = jax.lax.scan(
+            scan_body, (jnp.float32(0.0), dw_init), (x_ch, y_ch, m_ch)
+        )
+        return tot_sum, (dx_chunks, dw_sum.astype(lm_w.dtype))
+
+    def _bwd(res, g_out):
+        dx_chunks, d_lm_w = res
+        return (
+            dx_chunks * g_out.astype(dx_chunks.dtype),
+            d_lm_w * g_out.astype(d_lm_w.dtype),
+            None,
+            None,
+            None,
+        )
+
+    _fused.defvjp(_fwd, _bwd)
+    return _fused
+
+
+def _make_fused_masked_ce_int8_bwd_fn(softcap: float, mesh: Optional[Mesh]):
+    """Single-pass masked Cut-Cross-Entropy with 394-TOPS INT8 backward `lm_head` for MTP."""
+    @jax.custom_vjp
+    def _fused(x_ch, lm_w, lm_w_qb, lm_w_sb, y_ch, m_ch, scale):
+        inv_valid = scale / jnp.maximum(jnp.sum(m_ch, dtype=jnp.float32), jnp.float32(1.0))
+
+        def fwd_body(acc, triple):
+            xc, yc, mc = triple
+            nll_c, _ = _chunk_ce_and_z(xc, yc, lm_w, softcap)
+            return acc + jnp.sum(nll_c * mc, dtype=jnp.float32) * inv_valid, None
+
+        tot, _ = jax.lax.scan(fwd_body, jnp.float32(0.0), (x_ch, y_ch, m_ch))
+        return tot
+
+    def _fwd(x_ch, lm_w, lm_w_qb, lm_w_sb, y_ch, m_ch, scale):
+        vocab_size = lm_w.shape[1]
+        inv_valid = scale / jnp.maximum(jnp.sum(m_ch, dtype=jnp.float32), jnp.float32(1.0))
+        dw_acc_dtype = jnp.float32 if lm_w.dtype == jnp.float16 else lm_w.dtype
+        dw_init = jnp.zeros_like(lm_w, dtype=dw_acc_dtype)
+
+        def scan_body(carry, triple):
+            tot_acc, dw_acc = carry
+            xc, yc, mc = triple
+            raw = jnp.dot(xc, lm_w, preferred_element_type=jnp.float32)
+            if softcap > 0.0:
+                th = jnp.tanh(raw / softcap)
+                logits = softcap * th
+            else:
+                th = None
+                logits = raw
+            log_z = jax.scipy.special.logsumexp(logits, axis=-1)
+            target_logits = jnp.take_along_axis(logits, yc[..., None], axis=-1)[..., 0]
+            tot_c = jnp.sum((log_z - target_logits) * mc, dtype=jnp.float32) * inv_valid
+
+            probs = jnp.exp(logits - log_z[:, None])
+            d_logits = (probs - jax.nn.one_hot(yc, vocab_size, dtype=jnp.float32)) * mc[:, None]
+            d_raw = d_logits * (jnp.float32(1.0) - th * th) if th is not None else d_logits
+
+            dr_q, dr_s = quantize_int8(d_raw, axis=-1)
+            dx_i32 = jnp.dot(dr_q, lm_w_qb.T, preferred_element_type=jnp.int32)
+            dx_c = (dx_i32.astype(jnp.float32) * (dr_s * lm_w_sb.T) * inv_valid).astype(xc.dtype)
+
+            xt_q, xt_s = _quantize_x_for_dw_int8(xc, mesh)
+            dw_unnorm = _dw_from_saved_xt_int8(xt_q, xt_s, d_raw, dw_acc_dtype, mesh)
+            dw_acc = dw_acc + (dw_unnorm.astype(jnp.float32) * inv_valid).astype(dw_acc_dtype)
+            return (tot_acc + tot_c, dw_acc), dx_c
+
+        (tot_sum, dw_sum), dx_chunks = jax.lax.scan(
+            scan_body, (jnp.float32(0.0), dw_init), (x_ch, y_ch, m_ch)
+        )
+        return tot_sum, (dx_chunks, dw_sum.astype(lm_w.dtype))
+
+    def _bwd(res, g_out):
+        dx_chunks, d_lm_w = res
+        return (
+            dx_chunks * g_out.astype(dx_chunks.dtype),
+            d_lm_w * g_out.astype(d_lm_w.dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+    _fused.defvjp(_fwd, _bwd)
+    return _fused
+
+
+def _compute_mtp_hidden(
+    params: dict,
+    x: jax.Array,
+    targets: jax.Array,
+    spec: ModelSpec,
+    compute_dtype,
+    mesh: Optional[Mesh] = None,
+) -> jax.Array:
+    """Strictly-causal lightweight SwiGLU Multi-Token Prediction (t+2) head."""
+    B, T, C = x.shape
+    mb = params["mtp_blocks"]
+    qmode = spec.matmul_quant
+    e_next = rms_norm(params["wte"][targets].astype(compute_dtype))
+    h_cat = jnp.concatenate([x, e_next], axis=-1).reshape(B * T, 2 * C)
+    h = qdot(h_cat, mb["mtp_proj"][0].astype(compute_dtype), mode=qmode, mesh=mesh).reshape(B, T, C)
+    m_h = rms_norm(h)
+    if "mtp_canon" in params:
+        m_h = _apply_canon_conv4(m_h, params["mtp_canon"])
+    gu = qdot(m_h.reshape(B * T, C), mb["w_gate_up"][0].astype(compute_dtype), mode=qmode, mesh=mesh)
+    gate, up = jnp.split(gu, 2, axis=-1)
+    m = jax.nn.silu(gate) * up
+    mlp_out = qdot(m, mb["mlp_down"][0].astype(compute_dtype), mode=qmode, mesh=mesh).reshape(B, T, C)
+    return rms_norm(h + mlp_out)
+
+
 def _pack_fsdp_chunks(x: jax.Array, targets: jax.Array, chunk_sz: int, mesh: Optional[Mesh]):
     """
     Pack `(B, T, C)` and `(B, T)` into `(n_chunks, n_dev * chunk_sz, C)` so every FSDP chip
@@ -793,6 +944,7 @@ def forward_scalar_loss_and_z(
     Training loss entry point returning `(scaled_total_loss, mean_ce, mean_z)`.
     Uses single-pass fused Cut-Cross-Entropy when chunking applies (0% lm_head recompute,
     ~16x lower logits HBM, and zero cross-chip resharding on multi-chip FSDP!).
+    Optionally adds strictly-causal SwiGLU Multi-Token Prediction (t+2) auxiliary loss.
     """
     q_blocks = q_cache["blocks"] if (q_cache is not None and "blocks" in q_cache) else None
     x = forward_hidden(params, idx, cos, sin, spec, compute_dtype, mesh=mesh, q_blocks=q_blocks)
@@ -804,14 +956,39 @@ def forward_scalar_loss_and_z(
         if spec.matmul_quant == "int8-all" and q_cache is not None and "lm_head_bwd" in q_cache:
             lm_w_qb, lm_w_sb = q_cache["lm_head_bwd"]
             fused_q_fn = _make_fused_chunked_loss_int8_bwd_fn(spec.softcap, spec.z_loss_weight, mesh)
-            return fused_q_fn(x_chunks, lm_w, lm_w_qb, lm_w_sb, y_chunks, scale)
-        fused_fn = _make_fused_chunked_loss_fn(spec.softcap, spec.z_loss_weight)
-        return fused_fn(x_chunks, lm_w, y_chunks, scale)
+            tot, ce, z_loss = fused_q_fn(x_chunks, lm_w, lm_w_qb, lm_w_sb, y_chunks, scale)
+        else:
+            fused_fn = _make_fused_chunked_loss_fn(spec.softcap, spec.z_loss_weight)
+            tot, ce, z_loss = fused_fn(x_chunks, lm_w, y_chunks, scale)
+    else:
+        B, T, C = x.shape
+        nll, z_loss = _chunk_ce_and_z(x.reshape(B * T, C), targets.reshape(B * T), lm_w, spec.softcap)
+        ce = jnp.mean(nll, dtype=jnp.float32)
+        tot = (ce + jnp.float32(spec.z_loss_weight) * z_loss) * scale
 
-    B, T, C = x.shape
-    nll, z_loss = _chunk_ce_and_z(x.reshape(B * T, C), targets.reshape(B * T), lm_w, spec.softcap)
-    ce = jnp.mean(nll, dtype=jnp.float32)
-    tot = (ce + jnp.float32(spec.z_loss_weight) * z_loss) * scale
+    if spec.mtp_weight > 0.0 and "mtp_blocks" in params:
+        B, T, C = x.shape
+        h_mtp = _compute_mtp_hidden(params, x, targets, spec, compute_dtype, mesh=mesh)
+        y_mtp = jnp.concatenate([targets[:, 1:], jnp.zeros_like(targets[:, :1])], axis=1)
+        m_mtp = jnp.broadcast_to((jnp.arange(T)[None, :] < (T - 1)).astype(jnp.float32), (B, T))
+        mtp_scale = scale * jnp.float32(spec.mtp_weight)
+        packed_m = _pack_fsdp_chunks(h_mtp, y_mtp, spec.loss_chunk_size, mesh)
+        if packed_m is not None:
+            xm_ch, ym_ch, n_dev, n_chunks = packed_m
+            mm_ch = m_mtp.reshape(n_dev, n_chunks, spec.loss_chunk_size).transpose(1, 0, 2).reshape(n_chunks, n_dev * spec.loss_chunk_size)
+            if spec.matmul_quant == "int8-all" and q_cache is not None and "lm_head_bwd" in q_cache:
+                lm_w_qb, lm_w_sb = q_cache["lm_head_bwd"]
+                mtp_fn = _make_fused_masked_ce_int8_bwd_fn(spec.softcap, mesh)
+                tot_mtp = mtp_fn(xm_ch, lm_w, lm_w_qb, lm_w_sb, ym_ch, mm_ch, mtp_scale)
+            else:
+                mtp_fn = _make_fused_masked_ce_fn(spec.softcap)
+                tot_mtp = mtp_fn(xm_ch, lm_w, ym_ch, mm_ch, mtp_scale)
+        else:
+            nll_m, _ = _chunk_ce_and_z(h_mtp.reshape(B * T, C), y_mtp.reshape(B * T), lm_w, spec.softcap)
+            m_flat = m_mtp.reshape(B * T)
+            tot_mtp = (jnp.sum(nll_m * m_flat, dtype=jnp.float32) / jnp.maximum(jnp.sum(m_flat), jnp.float32(1.0))) * mtp_scale
+        tot = tot + tot_mtp
+
     return tot, ce, z_loss
 
 
@@ -868,7 +1045,9 @@ def count_params(params: dict) -> dict[str, int]:
     lm_head = int(params["lm_head"].size) if "lm_head" in params else 0
     ve = int(params["value_embeds"].size) if "value_embeds" in params else 0
     blocks = sum(int(a.size) for a in jax.tree_util.tree_leaves(params["blocks"]))
-    known_non_scalar = {"wte", "lm_head", "value_embeds", "blocks"}
+    if "mtp_blocks" in params:
+        blocks += sum(int(a.size) for a in jax.tree_util.tree_leaves(params["mtp_blocks"]))
+    known_non_scalar = {"wte", "lm_head", "value_embeds", "blocks", "mtp_blocks"}
     scalars = sum(int(v.size) for k, v in params.items() if k not in known_non_scalar)
     total = wte + lm_head + ve + blocks + scalars
     return {

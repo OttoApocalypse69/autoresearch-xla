@@ -24,6 +24,7 @@ POLAR_EXPRESS_COEFFS = (
 
 
 GATE_BLOCK_KEYS = ("ve_gate", "w_attn_gate")
+EXTRA_BLOCK_GROUPS = ("mtp_blocks",)
 EXTRA_SCALAR_KEYS = (
     "unet_lambdas",
     "qk_gain",
@@ -33,11 +34,27 @@ EXTRA_SCALAR_KEYS = (
     "smear_lambda2",
     "canon_a",
     "canon_c",
+    "mtp_canon",
 )
-GENTLE_SCALAR_KEYS = ("qk_gain", "canon_a", "canon_c")
+GENTLE_SCALAR_KEYS = (
+    "qk_gain",
+    "canon_a",
+    "canon_c",
+    "mtp_canon",
+)
 
 
-def init_opt_state(params: dict, opt_dtype=jnp.float32, gate_adamw: bool = False) -> dict:
+def _muon_sec_shape(L: int, r: int, c: int) -> tuple[int, int, int]:
+    return (L, r, 1) if r >= c else (L, 1, c)
+
+
+def init_opt_state(
+    params: dict,
+    opt_dtype=jnp.float32,
+    gate_adamw: bool = False,
+    split_muon: bool = True,
+    spec: ModelSpec | None = None,
+) -> dict:
     """Create optimizer state pytree matching `params` (supports fp32 or bf16 state)."""
     def adamw_zeros(arr):
         return {
@@ -45,18 +62,32 @@ def init_opt_state(params: dict, opt_dtype=jnp.float32, gate_adamw: bool = False
             "v": jnp.zeros_like(arr, dtype=opt_dtype),
         }
 
-    block_states = {}
-    for name, w in params["blocks"].items():
+    def muon_zeros_for_block(name: str, w: jax.Array):
         if gate_adamw and name in GATE_BLOCK_KEYS:
-            block_states[name] = adamw_zeros(w)
-            continue
-        # Stacked block tensor: (n_layer, rows, cols)
+            return adamw_zeros(w)
         L, r, c = w.shape
-        sec_shape = (L, r, 1) if r >= c else (L, 1, c)
-        block_states[name] = {
+        if split_muon and name == "w_qkv" and spec is not None:
+            C = spec.n_embd
+            kv = spec.kv_dim
+            return {
+                "m": jnp.zeros_like(w, dtype=opt_dtype),
+                "v_q": jnp.zeros(_muon_sec_shape(L, r, C), dtype=jnp.float32),
+                "v_k": jnp.zeros(_muon_sec_shape(L, r, kv), dtype=jnp.float32),
+                "v_v": jnp.zeros(_muon_sec_shape(L, r, kv), dtype=jnp.float32),
+            }
+        if split_muon and name == "w_gate_up":
+            half_c = c // 2
+            return {
+                "m": jnp.zeros_like(w, dtype=opt_dtype),
+                "v_gate": jnp.zeros(_muon_sec_shape(L, r, half_c), dtype=jnp.float32),
+                "v_up": jnp.zeros(_muon_sec_shape(L, r, half_c), dtype=jnp.float32),
+            }
+        return {
             "m": jnp.zeros_like(w, dtype=opt_dtype),
-            "v_rowcol": jnp.zeros(sec_shape, dtype=jnp.float32),
+            "v_rowcol": jnp.zeros(_muon_sec_shape(L, r, c), dtype=jnp.float32),
         }
+
+    block_states = {name: muon_zeros_for_block(name, w) for name, w in params["blocks"].items()}
 
     state: dict = {
         "step": jnp.array(0, dtype=jnp.int32),
@@ -69,6 +100,9 @@ def init_opt_state(params: dict, opt_dtype=jnp.float32, gate_adamw: bool = False
         state["lm_head"] = adamw_zeros(params["lm_head"])
     if "value_embeds" in params:
         state["value_embeds"] = adamw_zeros(params["value_embeds"])
+    for bg in EXTRA_BLOCK_GROUPS:
+        if bg in params:
+            state[bg] = {name: muon_zeros_for_block(name, w) for name, w in params[bg].items()}
     for k in EXTRA_SCALAR_KEYS:
         if k in params:
             state[k] = adamw_zeros(params[k])
@@ -242,35 +276,80 @@ def optimizer_step(
                 k_lr, 0.96, 0.95, next_sr_key(),
             )
 
-    new_blocks, st_blocks = {}, {}
-    for name in params["blocks"]:
-        if tcfg.gate_adamw and name in GATE_BLOCK_KEYS:
-            new_blocks[name], st_blocks[name] = _adamw_update(
-                params["blocks"][name],
-                grads["blocks"][name],
-                opt_state["blocks"][name],
-                step_f,
-                tcfg.scalar_lr * lrm,
-                b1,
-                b2,
-                next_sr_key(),
+    def _update_block_dict(p_dict: dict, g_dict: dict, st_dict: dict):
+        nb, sb = {}, {}
+        for name in p_dict:
+            if tcfg.gate_adamw and name in GATE_BLOCK_KEYS:
+                nb[name], sb[name] = _adamw_update(
+                    p_dict[name], g_dict[name], st_dict[name], step_f,
+                    tcfg.scalar_lr * lrm, b1, b2, next_sr_key(),
+                )
+                continue
+            p_w, g_w, st_w = p_dict[name], g_dict[name], st_dict[name]
+            if tcfg.split_muon and name == "w_qkv" and "v_q" in st_w:
+                C = spec.n_embd
+                kv = spec.kv_dim
+                pq, pk, pv = p_w[..., :C], p_w[..., C : C + kv], p_w[..., C + kv :]
+                gq, gk, gv = g_w[..., :C], g_w[..., C : C + kv], g_w[..., C + kv :]
+                mq, mk, mv = st_w["m"][..., :C], st_w["m"][..., C : C + kv], st_w["m"][..., C + kv :]
+                pq_n, st_q = _muon_update_blocks(
+                    pq, gq, {"m": mq, "v_rowcol": st_w["v_q"]}, next_sr_key(),
+                    tcfg.matrix_lr * lrm, muon_momentum, muon_wd, ns_dtype, tcfg.muon_beta2, tcfg.muon_ns_steps,
+                    use_vmap=tcfg.muon_vmap,
+                )
+                pk_n, st_k = _muon_update_blocks(
+                    pk, gk, {"m": mk, "v_rowcol": st_w["v_k"]}, next_sr_key(),
+                    tcfg.matrix_lr * lrm, muon_momentum, muon_wd, ns_dtype, tcfg.muon_beta2, tcfg.muon_ns_steps,
+                    use_vmap=tcfg.muon_vmap,
+                )
+                pv_n, st_v = _muon_update_blocks(
+                    pv, gv, {"m": mv, "v_rowcol": st_w["v_v"]}, next_sr_key(),
+                    tcfg.matrix_lr * lrm, muon_momentum, muon_wd, ns_dtype, tcfg.muon_beta2, tcfg.muon_ns_steps,
+                    use_vmap=tcfg.muon_vmap,
+                )
+                nb[name] = jnp.concatenate([pq_n, pk_n, pv_n], axis=-1)
+                sb[name] = {
+                    "m": jnp.concatenate([st_q["m"], st_k["m"], st_v["m"]], axis=-1),
+                    "v_q": st_q["v_rowcol"],
+                    "v_k": st_k["v_rowcol"],
+                    "v_v": st_v["v_rowcol"],
+                }
+                continue
+            if tcfg.split_muon and name == "w_gate_up" and "v_gate" in st_w:
+                half = p_w.shape[-1] // 2
+                p1, p2 = p_w[..., :half], p_w[..., half:]
+                g1, g2 = g_w[..., :half], g_w[..., half:]
+                m1, m2 = st_w["m"][..., :half], st_w["m"][..., half:]
+                p1_n, st_1 = _muon_update_blocks(
+                    p1, g1, {"m": m1, "v_rowcol": st_w["v_gate"]}, next_sr_key(),
+                    tcfg.matrix_lr * lrm, muon_momentum, muon_wd, ns_dtype, tcfg.muon_beta2, tcfg.muon_ns_steps,
+                    use_vmap=tcfg.muon_vmap,
+                )
+                p2_n, st_2 = _muon_update_blocks(
+                    p2, g2, {"m": m2, "v_rowcol": st_w["v_up"]}, next_sr_key(),
+                    tcfg.matrix_lr * lrm, muon_momentum, muon_wd, ns_dtype, tcfg.muon_beta2, tcfg.muon_ns_steps,
+                    use_vmap=tcfg.muon_vmap,
+                )
+                nb[name] = jnp.concatenate([p1_n, p2_n], axis=-1)
+                sb[name] = {
+                    "m": jnp.concatenate([st_1["m"], st_2["m"]], axis=-1),
+                    "v_gate": st_1["v_rowcol"],
+                    "v_up": st_2["v_rowcol"],
+                }
+                continue
+            nb[name], sb[name] = _muon_update_blocks(
+                p_w, g_w, st_w, next_sr_key(),
+                tcfg.matrix_lr * lrm, muon_momentum, muon_wd, ns_dtype, tcfg.muon_beta2, tcfg.muon_ns_steps,
+                use_vmap=tcfg.muon_vmap,
             )
-            continue
-        new_blocks[name], st_blocks[name] = _muon_update_blocks(
-            params["blocks"][name],
-            grads["blocks"][name],
-            opt_state["blocks"][name],
-            next_sr_key(),
-            tcfg.matrix_lr * lrm,
-            muon_momentum,
-            muon_wd,
-            ns_dtype,
-            tcfg.muon_beta2,
-            tcfg.muon_ns_steps,
-            use_vmap=tcfg.muon_vmap,
-        )
-    new_params["blocks"] = new_blocks
-    new_state["blocks"] = st_blocks
+        return nb, sb
+
+    new_params["blocks"], new_state["blocks"] = _update_block_dict(
+        params["blocks"], grads["blocks"], opt_state["blocks"]
+    )
+    for bg in EXTRA_BLOCK_GROUPS:
+        if bg in params:
+            new_params[bg], new_state[bg] = _update_block_dict(params[bg], grads[bg], opt_state[bg])
     return new_params, new_state, grad_norm
 
 

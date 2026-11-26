@@ -42,6 +42,7 @@ class ModelSpec:
     use_unet_skip: bool = False      # Modded-nanogpt symmetric encoder->decoder U-Net skip connections
     tie_embeddings: bool = False     # Tie wte & lm_head weights
     rope_base: float = 10000.0
+    mtp_weight: float = 0.0          # Optional DeepSeek-V3/Gemma-4 SwiGLU Multi-Token Prediction (t+2) weight (e.g. 0.05)
     softcap: float = 15.0            # 0.0 disables logit softcapping
     z_loss_weight: float = 1e-4      # Auxiliary router/logit stability loss (0.0 disables)
     use_remat: bool = True           # Legacy bool (overridden when remat_policy != "auto")
@@ -58,6 +59,7 @@ class ModelSpec:
         assert self.activation in ("swiglu", "relu2", "gelu"), f"Unsupported activation: {self.activation!r}"
         assert all(c in "SL" for c in self.window_pattern.upper()), f"Invalid window_pattern: {self.window_pattern!r}"
         assert self.attn_gate_mode in ("headwise", "elementwise"), f"Invalid attn_gate_mode: {self.attn_gate_mode!r}"
+        assert self.mtp_weight >= 0.0, f"mtp_weight must be >= 0, got {self.mtp_weight}"
         valid_remat = ("none", "save_all_compute", "save_attn", "save_qkv_attn", "dots_with_no_batch_dims", "dots", "full")
         assert self.remat_policy in valid_remat, f"Invalid remat_policy: {self.remat_policy!r}"
         assert self.attn_impl in ("auto", "splash", "cudnn", "xla"), f"Invalid attn_impl: {self.attn_impl!r}"
@@ -170,10 +172,10 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         remat_policy="save_attn",
         loss_chunk_size=2048,
     ),
-    # ~1.456B total / 1.120B active Round-4 Final Boss autoresearch champion (-0.2310 BPB on live mix-1b: 1.7867 -> 1.5557!):
+    # ~1.456B total / 1.120B active Round-5 autoresearch champion (-0.2379 BPB on live mix-1b: 1.7867 -> 1.5487!):
     # Value Embeddings (full VE gate) + SSSL window + U-Net skips + Qwen3 Elementwise Gated Attention (INT8 MXU) +
     # Per-channel Bigram+Trigram Smear + Allen-Zhu Canon-A/C conv4 + ResFormer v0 residual + gentle QK-norm gain + RoPE 50k + z_loss 5e-4.
-    # Recommended optimizer flags: --matrix-lr 0.06 --embedding-lr 0.5 --weight-decay 0.03
+    # Recommended optimizer flags: --matrix-lr 0.04 --embedding-lr 0.5 --weight-decay 0.03 (Qwen 3.8 Split-Muon default ON!)
     "1b-ve": ModelSpec(
         sequence_len=2048,
         vocab_size=32768,
@@ -243,6 +245,7 @@ class TrainConfig:
     muon_ns_steps: int = 5
     muon_vmap: bool = False           # False = low-HBM lax.scan; True = batched vmap (great on v5e-8 / G4!)
     gate_adamw: bool = False          # Use AdamW (not Muon) for tiny gate tensors (ve_gate, w_attn_gate)
+    split_muon: bool = True           # Qwen 3.8 Split-Muon: orthogonalize Q/K/V and gate/up independently!
     grad_clip: float = 1.0
 
     # WSD (Warmup -> Stable -> Decay) schedule for seamless multi-session pretraining!

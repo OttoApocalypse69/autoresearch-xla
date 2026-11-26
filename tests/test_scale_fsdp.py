@@ -651,33 +651,38 @@ tcfg = TrainConfig(
     per_device_batch=1,
     param_dtype="bfloat16",
     opt_dtype="bfloat16",
-    matrix_lr=0.06,
+    matrix_lr=0.04,
     embedding_lr=0.5,
     weight_decay=0.03,
     muon_vmap=True,
 )
-p_sh = build_tree_shardings(p_half, mesh, use_fsdp=True)
-params = shard_pytree(p_half, p_sh)
-opt_state = init_opt_state(params, opt_dtype=jnp.bfloat16)
+assert tcfg.split_muon is True
+spec_mtp = get_model_preset("smoke", arch_overrides={**common_ov, "ve_stride": 2, "mtp_weight": 0.05})
+p_mtp = init_params(jax.random.PRNGKey(0), spec_mtp, param_dtype=jnp.bfloat16)
+assert "mtp_blocks" in p_mtp and "mtp_canon" in p_mtp
+p_sh = build_tree_shardings(p_mtp, mesh, use_fsdp=True)
+params = shard_pytree(p_mtp, p_sh)
+opt_state = init_opt_state(params, opt_dtype=jnp.bfloat16, split_muon=True, spec=spec_mtp)
+assert "v_q" in opt_state["blocks"]["w_qkv"] and "v_gate" in opt_state["blocks"]["w_gate_up"]
 o_sh = build_tree_shardings(opt_state, mesh, use_fsdp=True)
 opt_state = shard_pytree(opt_state, o_sh)
 
-cos, sin = precompute_rotary_embeddings(spec_half.sequence_len, spec_half.head_dim, base=spec_half.rope_base)
+cos, sin = precompute_rotary_embeddings(spec_mtp.sequence_len, spec_mtp.head_dim, base=spec_mtp.rope_base)
 batch_sh = NamedSharding(mesh, P("fsdp", None))
-x = jax.device_put(jax.random.randint(jax.random.PRNGKey(7), (8, spec_half.sequence_len), 0, spec_half.vocab_size), batch_sh)
-y = jax.device_put(jax.random.randint(jax.random.PRNGKey(8), (8, spec_half.sequence_len), 0, spec_half.vocab_size), batch_sh)
+x = jax.device_put(jax.random.randint(jax.random.PRNGKey(7), (8, spec_mtp.sequence_len), 0, spec_mtp.vocab_size), batch_sh)
+y = jax.device_put(jax.random.randint(jax.random.PRNGKey(8), (8, spec_mtp.sequence_len), 0, spec_mtp.vocab_size), batch_sh)
 
 @jax.jit
 def step_fn(p, st):
-    q_cache = prequantize_model_weights(p, spec_half.matmul_quant, spec_half.tie_embeddings)
+    q_cache = prequantize_model_weights(p, spec_mtp.matmul_quant, spec_mtp.tie_embeddings)
     def loss_fn(p_in):
         tot, ce, _ = forward_scalar_loss_and_z(
-            p_in, x, y, cos, sin, spec_half, jnp.bfloat16, scale=jnp.float32(1.0), mesh=mesh, q_cache=q_cache
+            p_in, x, y, cos, sin, spec_mtp, jnp.bfloat16, scale=jnp.float32(1.0), mesh=mesh, q_cache=q_cache
         )
         return tot, ce
     (_, ce), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
     p_next, st_next, gnorm = optimizer_step(
-        p, grads, st, jnp.float32(1.0), jnp.float32(0.9), jnp.float32(0.03), spec_half, tcfg, jnp.bfloat16
+        p, grads, st, jnp.float32(1.0), jnp.float32(0.9), jnp.float32(0.03), spec_mtp, tcfg, jnp.bfloat16
     )
     return p_next, st_next, ce, gnorm
 
@@ -686,8 +691,8 @@ for _ in range(3):
     params, opt_state, ce, gnorm = step_fn(params, opt_state)
     assert np.isfinite(float(ce)) and np.isfinite(float(gnorm))
     losses.append(float(ce))
-assert losses[-1] < losses[0], f"Round-4 Final Boss 8-dev FSDP loss did not decrease: {losses}"
-print(f"Round-4 Final Boss 8-dev FSDP OK: losses={losses}")
+assert losses[-1] < losses[0], f"Round-5 Split-Muon + MTP 8-dev FSDP loss did not decrease: {losses}"
+print(f"Round-5 Split-Muon + MTP 8-dev FSDP OK: losses={losses}")
 """
     res = subprocess.run(
         [PYTHON, "-c", code],
@@ -696,6 +701,6 @@ print(f"Round-4 Final Boss 8-dev FSDP OK: losses={losses}")
         capture_output=True,
         text=True,
     )
-    assert res.returncode == 0, f"Round-4 Final Boss 8-dev FSDP test failed:\n{res.stdout}\n{res.stderr}"
+    assert res.returncode == 0, f"Round-5 Split-Muon + MTP 8-dev FSDP test failed:\n{res.stdout}\n{res.stderr}"
 
 

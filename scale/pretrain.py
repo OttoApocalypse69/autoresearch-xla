@@ -229,13 +229,16 @@ def run_benchmark(spec: ModelSpec, tcfg: TrainConfig, warmup_steps: int = 2, tim
     key = jax.random.PRNGKey(tcfg.seed)
     init_p_fn = functools.partial(init_params, spec=spec, param_dtype=param_dtype)
     abs_p = jax.eval_shape(init_p_fn, key)
-    abs_o = jax.eval_shape(functools.partial(init_opt_state, opt_dtype=opt_dtype, gate_adamw=tcfg.gate_adamw), abs_p)
+    abs_o = jax.eval_shape(
+        functools.partial(init_opt_state, opt_dtype=opt_dtype, gate_adamw=tcfg.gate_adamw, split_muon=tcfg.split_muon, spec=spec),
+        abs_p,
+    )
     param_shardings = build_tree_shardings(abs_p, mesh, use_fsdp=tcfg.use_fsdp)
     opt_shardings = build_tree_shardings(abs_o, mesh, use_fsdp=tcfg.use_fsdp)
 
     params = jax.jit(init_p_fn, out_shardings=param_shardings)(key)
     opt_state = jax.jit(
-        functools.partial(init_opt_state, opt_dtype=opt_dtype, gate_adamw=tcfg.gate_adamw),
+        functools.partial(init_opt_state, opt_dtype=opt_dtype, gate_adamw=tcfg.gate_adamw, split_muon=tcfg.split_muon, spec=spec),
         in_shardings=(param_shardings,),
         out_shardings=opt_shardings,
     )(params)
@@ -368,7 +371,10 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
     key = jax.random.PRNGKey(tcfg.seed)
     init_p_fn = functools.partial(init_params, spec=spec, param_dtype=param_dtype)
     abstract_params = jax.eval_shape(init_p_fn, key)
-    abstract_opt = jax.eval_shape(functools.partial(init_opt_state, opt_dtype=opt_dtype, gate_adamw=tcfg.gate_adamw), abstract_params)
+    abstract_opt = jax.eval_shape(
+        functools.partial(init_opt_state, opt_dtype=opt_dtype, gate_adamw=tcfg.gate_adamw, split_muon=tcfg.split_muon, spec=spec),
+        abstract_params,
+    )
     param_shardings = build_tree_shardings(abstract_params, mesh, use_fsdp=tcfg.use_fsdp)
     opt_shardings = build_tree_shardings(abstract_opt, mesh, use_fsdp=tcfg.use_fsdp)
 
@@ -403,7 +409,7 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
     else:
         params = jax.jit(init_p_fn, out_shardings=param_shardings)(key)
         opt_state = jax.jit(
-            functools.partial(init_opt_state, opt_dtype=opt_dtype, gate_adamw=tcfg.gate_adamw),
+            functools.partial(init_opt_state, opt_dtype=opt_dtype, gate_adamw=tcfg.gate_adamw, split_muon=tcfg.split_muon, spec=spec),
             in_shardings=(param_shardings,),
             out_shardings=opt_shardings,
         )(params)
@@ -764,6 +770,8 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--muon-ns-steps", type=int, default=5)
     parser.add_argument("--gate-adamw", action="store_true", help="Update small gate tensors (ve_gate, w_attn_gate) with AdamW instead of Muon")
+    parser.add_argument("--split-muon", action="store_true", default=True, help="Qwen 3.8 Split-Muon (default ON): orthogonalize Q/K/V and gate/up independently")
+    parser.add_argument("--no-split-muon", action="store_false", dest="split_muon", help="Disable Qwen 3.8 Split-Muon orthogonalization")
     parser.add_argument("--max-steps", type=int, default=None, help="Max steps for this session")
     parser.add_argument("--max-hours", type=float, default=8.5, help="Graceful exit wall-clock cap in hours")
     parser.add_argument("--log-every", type=int, default=10)
@@ -817,6 +825,7 @@ def main() -> None:
         opt_dtype=args.opt_dtype,
         muon_vmap=args.muon_vmap,
         gate_adamw=args.gate_adamw,
+        split_muon=args.split_muon,
         use_fsdp=not args.no_fsdp,
         matrix_lr=args.matrix_lr,
         embedding_lr=args.embedding_lr,
