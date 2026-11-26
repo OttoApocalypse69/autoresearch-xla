@@ -632,17 +632,6 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
                 window_start = time.perf_counter()
                 window_steps = 0
 
-            if should_sample:
-                prompt_ids = tokenizer.encode(SAMPLE_PROMPT, prepend=tokenizer.get_bos_token_id())
-                out_ids = generate_tokens(
-                    params, prompt_ids, max_new_tokens=48, spec=spec, compute_dtype=compute_dtype,
-                    temperature=0.8, top_k=40, seed=step, batch_sharding=batch_sharding,
-                )
-                sample_txt = tokenizer.decode(out_ids[1:]).replace("\n", " ")
-                print(f"  >>> [Sample step {step}] {sample_txt[:220]}", flush=True)
-                window_start = time.perf_counter()
-                window_steps = 0
-
             if should_save:
                 gc.enable()
                 ckpt_mgr.save(
@@ -655,6 +644,20 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
                 )
                 last_saved_step = step
                 gc.disable()
+                window_start = time.perf_counter()
+                window_steps = 0
+
+            if should_sample:
+                try:
+                    prompt_ids = tokenizer.encode(SAMPLE_PROMPT, prepend=tokenizer.get_bos_token_id())
+                    out_ids = generate_tokens(
+                        params, prompt_ids, max_new_tokens=48, spec=spec, compute_dtype=compute_dtype,
+                        temperature=0.8, top_k=40, seed=step, batch_sharding=batch_sharding,
+                    )
+                    sample_txt = tokenizer.decode(out_ids[1:]).replace("\n", " ")
+                    print(f"  >>> [Sample step {step}] {sample_txt[:220]}", flush=True)
+                except Exception as exc:
+                    print(f"  >>> [Sample step {step}] skipped ({exc})", flush=True)
                 window_start = time.perf_counter()
                 window_steps = 0
 
@@ -680,6 +683,7 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
         )
         if last_val_bpb < best_val_bpb:
             best_val_bpb = last_val_bpb
+        _append_metric(metrics_path, {"step": step, "tokens_seen": tokens_seen, "val_bpb": round(last_val_bpb, 6)})
 
         if step > last_saved_step:
             ckpt_mgr.save(
@@ -778,11 +782,12 @@ def main() -> None:
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--sample-every", type=int, default=500)
     parser.add_argument("--save-every", type=int, default=500)
+    parser.add_argument("--keep-last-checkpoints", type=int, default=2, help="Local checkpoints retained on disk (use 1 on Kaggle 19.5 GB disk)")
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/1b")
     parser.add_argument("--shard-cache-dir", type=str, default="/tmp/autoresearch_shards")
     parser.add_argument("--keep-shards", type=int, default=2, help="Max rolling shards kept on disk per source")
     parser.add_argument("--sync-backend", choices=["none", "local", "hf", "kaggle"], default="none")
-    parser.add_argument("--remote-target", type=str, default=None, help="Drive dir, HF repo_id, or Kaggle dataset slug")
+    parser.add_argument("--remote-target", type=str, default=None, help="Drive dir, HF repo_id (supports auto/<repo>), or Kaggle dataset slug")
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--benchmark-only", action="store_true", help="Run pure steady-state MFU microbenchmark")
@@ -842,6 +847,7 @@ def main() -> None:
         eval_every=args.eval_every,
         sample_every=args.sample_every,
         save_every=args.save_every,
+        keep_last_checkpoints=args.keep_last_checkpoints,
         checkpoint_dir=args.checkpoint_dir,
         sync_backend=args.sync_backend,
         remote_target=args.remote_target,

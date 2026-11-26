@@ -95,17 +95,18 @@ def unflatten_into_template(flat: dict[str, np.ndarray], template: dict, prefix:
 
 
 def _save_arrays(path_no_ext: Path, arrays: dict[str, np.ndarray], prefer_safetensors: bool = False) -> Path:
-    """Save flat array dict to `.safetensors` (if preferred & available) or `.npz`."""
-    if prefer_safetensors:
+    """Save flat array dict to `.safetensors` (if preferred & supported) or uncompressed `.npz`."""
+    has_bf16 = any(str(arr.dtype) == "bfloat16" for arr in arrays.values())
+    if prefer_safetensors and not has_bf16:
+        st_path = path_no_ext.with_suffix(".safetensors")
         try:
             from safetensors.numpy import save_file  # type: ignore
 
-            # safetensors numpy supports standard dtypes; cast bf16 if older safetensors rejects it
-            st_path = path_no_ext.with_suffix(".safetensors")
             save_file(arrays, str(st_path))
             return st_path
         except Exception:
-            pass
+            if st_path.exists():
+                st_path.unlink(missing_ok=True)
 
     # Standard .npz handles float32, float16, int32; store bfloat16 safely as uint16 view + tag
     packed: dict[str, np.ndarray] = {}
@@ -120,7 +121,7 @@ def _save_arrays(path_no_ext: Path, arrays: dict[str, np.ndarray], prefer_safete
         packed["__bf16_keys__"] = np.array(bf16_keys, dtype=object)
 
     npz_path = path_no_ext.with_suffix(".npz")
-    # Save uncompressed for maximum I/O speed on 1B+ models (saving 4 GB takes ~2-4s vs 60s compressed!)
+    # Save uncompressed for maximum I/O speed on 1B+ models (saving 6.8 GB takes ~3-5s vs 60s+ compressed!)
     np.savez(str(npz_path), **packed)
     return npz_path
 
@@ -167,6 +168,7 @@ class CheckpointManager:
         self.keep_last = max(1, keep_last)
         self.sync_backend = sync_backend
         self.remote_target = remote_target
+        self._hf_tokenizer_synced = False
 
     def _step_dir(self, step: int) -> Path:
         return self.checkpoint_dir / f"step_{step:07d}"
@@ -194,6 +196,9 @@ class CheckpointManager:
         metrics_path: Optional[str | Path] = None,
     ) -> Path:
         """Atomically save a topology-agnostic checkpoint, prune old ones, and sync remotely."""
+        import time
+
+        t0 = time.perf_counter()
         target_dir = self._step_dir(step)
         tmp_dir = self.checkpoint_dir / f".tmp_step_{step:07d}"
         if tmp_dir.exists():
@@ -201,9 +206,12 @@ class CheckpointManager:
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
         flat_params = flatten_pytree(params)
-        flat_opt = flatten_pytree(opt_state)
         _save_arrays(tmp_dir / "model", flat_params, prefer_safetensors=True)
+        del flat_params
+
+        flat_opt = flatten_pytree(opt_state)
         _save_arrays(tmp_dir / "opt_state", flat_opt, prefer_safetensors=False)
+        del flat_opt
 
         payload = {
             **trainer_state,
@@ -231,8 +239,28 @@ class CheckpointManager:
         )
         self._prune_old()
 
+        size_gb = sum(f.stat().st_size for f in target_dir.rglob("*") if f.is_file()) / (1024**3)
+        print(f"[Checkpoint] Saved {target_dir.name} ({size_gb:.2f} GB) in {time.perf_counter() - t0:.1f}s", flush=True)
+
         if self.sync_backend != "none" and self.remote_target:
-            self.sync_push(target_dir, metrics_path=metrics_path)
+            last_err: Optional[Exception] = None
+            for attempt in range(3):
+                try:
+                    self.sync_push(target_dir, metrics_path=metrics_path)
+                    last_err = None
+                    break
+                except Exception as exc:
+                    last_err = exc
+                    wait_s = 5 * (attempt + 1)
+                    print(
+                        f"[Sync:{self.sync_backend}] Push attempt {attempt + 1}/3 failed ({exc}); "
+                        + (f"retrying in {wait_s}s..." if attempt < 2 else "keeping local checkpoint and continuing."),
+                        flush=True,
+                    )
+                    if attempt < 2:
+                        time.sleep(wait_s)
+            if last_err is not None:
+                print(f"[Sync:{self.sync_backend}] WARNING: remote sync failed for {target_dir.name} (local copy is safe).", flush=True)
 
         return target_dir
 
@@ -240,6 +268,13 @@ class CheckpointManager:
         step_dirs = sorted(p for p in self.checkpoint_dir.glob("step_*") if p.is_dir())
         for old in step_dirs[: -self.keep_last]:
             shutil.rmtree(old, ignore_errors=True)
+
+    def _resolve_hf_repo_id(self, api) -> str:
+        assert self.remote_target is not None
+        if self.remote_target.startswith("auto/"):
+            user = api.whoami()["name"]
+            return f"{user}/{self.remote_target.split('/', 1)[1]}"
+        return self.remote_target
 
     def load_latest(
         self,
@@ -299,38 +334,56 @@ class CheckpointManager:
                 shutil.copytree(self.checkpoint_dir / "tokenizer", tok_dst)
             if metrics_path and Path(metrics_path).exists():
                 shutil.copy2(metrics_path, dst_root / "metrics.jsonl")
-            print(f"[Sync:local] Synced {step_dir.name} -> {dst_root}")
+            print(f"[Sync:local] Synced {step_dir.name} -> {dst_root}", flush=True)
 
         elif self.sync_backend == "hf":
-            from huggingface_hub import HfApi  # type: ignore
+            import time
+            from huggingface_hub import CommitOperationAdd, HfApi  # type: ignore
 
+            t0 = time.perf_counter()
             token = _get_secret("HF_TOKEN") or _get_secret("HUGGINGFACE_TOKEN")
             api = HfApi(token=token)
-            api.create_repo(repo_id=self.remote_target, repo_type="model", private=True, exist_ok=True)
-            api.upload_folder(
-                folder_path=str(step_dir),
-                path_in_repo="latest",
-                repo_id=self.remote_target,
+            repo_id = self._resolve_hf_repo_id(api)
+            api.create_repo(repo_id=repo_id, repo_type="model", private=True, exist_ok=True)
+            ops = [
+                CommitOperationAdd(
+                    path_in_repo=f"latest/{p.relative_to(step_dir).as_posix()}",
+                    path_or_fileobj=str(p),
+                )
+                for p in sorted(step_dir.rglob("*"))
+                if p.is_file()
+            ]
+            tok_dir = self.checkpoint_dir / "tokenizer"
+            sync_tok = tok_dir.is_dir() and not self._hf_tokenizer_synced
+            if sync_tok:
+                for p in sorted(tok_dir.rglob("*")):
+                    if p.is_file():
+                        ops.append(
+                            CommitOperationAdd(
+                                path_in_repo=f"tokenizer/{p.relative_to(tok_dir).as_posix()}",
+                                path_or_fileobj=str(p),
+                            )
+                        )
+            if metrics_path and Path(metrics_path).exists():
+                ops.append(
+                    CommitOperationAdd(
+                        path_in_repo="metrics.jsonl",
+                        path_or_fileobj=str(metrics_path),
+                    )
+                )
+            api.create_commit(
+                repo_id=repo_id,
                 repo_type="model",
+                operations=ops,
                 commit_message=f"Checkpoint {step_dir.name}",
             )
-            if (self.checkpoint_dir / "tokenizer").is_dir():
-                api.upload_folder(
-                    folder_path=str(self.checkpoint_dir / "tokenizer"),
-                    path_in_repo="tokenizer",
-                    repo_id=self.remote_target,
-                    repo_type="model",
-                    commit_message="Sync tokenizer",
-                )
-            if metrics_path and Path(metrics_path).exists():
-                api.upload_file(
-                    path_or_fileobj=str(metrics_path),
-                    path_in_repo="metrics.jsonl",
-                    repo_id=self.remote_target,
-                    repo_type="model",
-                    commit_message=f"Metrics {step_dir.name}",
-                )
-            print(f"[Sync:hf] Uploaded {step_dir.name} -> hf://{self.remote_target}/latest")
+            if sync_tok:
+                self._hf_tokenizer_synced = True
+            print(
+                f"[Sync:hf] Uploaded {step_dir.name} ({len(ops)} files, 1 atomic commit) -> "
+                f"hf://{repo_id}/latest in {time.perf_counter() - t0:.1f}s",
+                flush=True,
+            )
 
         elif self.sync_backend == "kaggle":
             stage = self.checkpoint_dir / ".kaggle_stage"
@@ -358,7 +411,7 @@ class CheckpointManager:
                     check=True,
                 )
             shutil.rmtree(stage, ignore_errors=True)
-            print(f"[Sync:kaggle] Pushed {step_dir.name} -> kaggle://{self.remote_target}")
+            print(f"[Sync:kaggle] Pushed {step_dir.name} -> kaggle://{self.remote_target}", flush=True)
 
     def sync_pull(self) -> bool:
         assert self.remote_target is not None
@@ -378,19 +431,25 @@ class CheckpointManager:
                 if tok_dst.exists():
                     shutil.rmtree(tok_dst)
                 shutil.copytree(src_root / "tokenizer", tok_dst)
+            if (src_root / "metrics.jsonl").is_file() and not (self.checkpoint_dir / "metrics.jsonl").exists():
+                shutil.copy2(src_root / "metrics.jsonl", self.checkpoint_dir / "metrics.jsonl")
             self._latest_pointer().write_text(
                 json.dumps({"step": step, "step_dir": dst.name}, indent=2) + "\n", encoding="utf-8"
             )
-            print(f"[Sync:local] Pulled step {step} from {src_root}")
+            print(f"[Sync:local] Pulled step {step} from {src_root}", flush=True)
             return True
 
         if self.sync_backend == "hf":
-            from huggingface_hub import snapshot_download  # type: ignore
+            from huggingface_hub import HfApi, snapshot_download  # type: ignore
 
             token = _get_secret("HF_TOKEN") or _get_secret("HUGGINGFACE_TOKEN")
+            api = HfApi(token=token)
+            repo_id = self._resolve_hf_repo_id(api)
             dl_dir = self.checkpoint_dir / ".hf_pull"
+            if dl_dir.exists():
+                shutil.rmtree(dl_dir)
             snapshot_download(
-                repo_id=self.remote_target,
+                repo_id=repo_id,
                 repo_type="model",
                 local_dir=str(dl_dir),
                 allow_patterns=["latest/*", "tokenizer/*", "metrics.jsonl"],
@@ -398,23 +457,26 @@ class CheckpointManager:
             )
             src_latest = dl_dir / "latest"
             if not (src_latest / "trainer_state.json").exists():
+                shutil.rmtree(dl_dir, ignore_errors=True)
                 return False
             state = json.loads((src_latest / "trainer_state.json").read_text(encoding="utf-8"))
             step = int(state["step"])
             dst = self._step_dir(step)
             if dst.exists():
                 shutil.rmtree(dst)
-            shutil.copytree(src_latest, dst)
+            shutil.move(str(src_latest), str(dst))
             if (dl_dir / "tokenizer").is_dir():
                 tok_dst = self.checkpoint_dir / "tokenizer"
                 if tok_dst.exists():
                     shutil.rmtree(tok_dst)
-                shutil.copytree(dl_dir / "tokenizer", tok_dst)
+                shutil.move(str(dl_dir / "tokenizer"), str(tok_dst))
+            if (dl_dir / "metrics.jsonl").is_file() and not (self.checkpoint_dir / "metrics.jsonl").exists():
+                shutil.move(str(dl_dir / "metrics.jsonl"), str(self.checkpoint_dir / "metrics.jsonl"))
             self._latest_pointer().write_text(
                 json.dumps({"step": step, "step_dir": dst.name}, indent=2) + "\n", encoding="utf-8"
             )
             shutil.rmtree(dl_dir, ignore_errors=True)
-            print(f"[Sync:hf] Pulled step {step} from hf://{self.remote_target}")
+            print(f"[Sync:hf] Pulled step {step} from hf://{repo_id}", flush=True)
             return True
 
         if self.sync_backend == "kaggle":

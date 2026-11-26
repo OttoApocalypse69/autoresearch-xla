@@ -704,3 +704,99 @@ print(f"Round-5 Split-Muon + MTP 8-dev FSDP OK: losses={losses}")
     assert res.returncode == 0, f"Round-5 Split-Muon + MTP 8-dev FSDP test failed:\n{res.stdout}\n{res.stderr}"
 
 
+def test_checkpoint_hardening_bf16_retries_and_hf_atomic_commit(tmp_path, monkeypatch):
+    """Verify BF16 npz safety (no stale .safetensors), keep_last=1 pruning, retry resilience, and atomic HF commit."""
+    import sys
+    import types
+    import jax
+    import jax.numpy as jnp
+    from scale.checkpoint import CheckpointManager, _load_arrays
+    from scale.config import get_model_preset
+    from scale.fsdp import build_tree_shardings, create_fsdp_mesh
+    from scale.model import init_params
+    from scale.optimizer import init_opt_state
+
+    spec = get_model_preset("smoke")
+    mesh = create_fsdp_mesh()
+    params = init_params(jax.random.PRNGKey(0), spec, param_dtype=jnp.bfloat16)
+    opt_state = init_opt_state(params, opt_dtype=jnp.bfloat16, split_muon=True, spec=spec)
+    p_sh = build_tree_shardings(params, mesh, use_fsdp=False)
+    o_sh = build_tree_shardings(opt_state, mesh, use_fsdp=False)
+
+    # Mock huggingface_hub to verify auto/<repo> resolution, retry resilience, and single atomic commit
+    commits = []
+    fail_budget = {"remaining": 2}
+
+    class FakeCommitAdd:
+        def __init__(self, path_in_repo, path_or_fileobj):
+            self.path_in_repo = path_in_repo
+            self.path_or_fileobj = path_or_fileobj
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            self.token = token
+
+        def whoami(self):
+            return {"name": "testuser"}
+
+        def create_repo(self, repo_id, repo_type="model", private=True, exist_ok=True):
+            assert repo_id == "testuser/my-1b-ve"
+            assert private is True
+
+        def create_commit(self, repo_id, repo_type, operations, commit_message):
+            if fail_budget["remaining"] > 0:
+                fail_budget["remaining"] -= 1
+                raise RuntimeError("transient 502")
+            commits.append((repo_id, commit_message, [op.path_in_repo for op in operations]))
+
+    fake_hf = types.ModuleType("huggingface_hub")
+    fake_hf.HfApi = FakeHfApi
+    fake_hf.CommitOperationAdd = FakeCommitAdd
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
+    monkeypatch.setenv("HF_TOKEN", "dummy-token")
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+
+    ckpt_dir = tmp_path / "ckpt"
+    tok_dir = tmp_path / "tok"
+    tok_dir.mkdir()
+    (tok_dir / "tokenizer.pkl").write_bytes(b"tok")
+    metrics_path = ckpt_dir / "metrics.jsonl"
+    ckpt_dir.mkdir()
+    metrics_path.write_text('{"step": 1}\n', encoding="utf-8")
+
+    mgr = CheckpointManager(ckpt_dir, keep_last=1, sync_backend="hf", remote_target="auto/my-1b-ve")
+
+    # Save step 10: fails 2x transiently, succeeds on 3rd attempt with 1 atomic commit including tokenizer + metrics
+    d1 = mgr.save(10, params, opt_state, {"step": 10}, tokenizer_dir=tok_dir, metrics_path=metrics_path)
+    assert (d1 / "model.npz").exists() and not (d1 / "model.safetensors").exists()
+    assert (d1 / "opt_state.npz").exists()
+    assert len(commits) == 1
+    assert commits[0][0] == "testuser/my-1b-ve"
+    assert "latest/model.npz" in commits[0][2]
+    assert "latest/opt_state.npz" in commits[0][2]
+    assert "tokenizer/tokenizer.pkl" in commits[0][2]
+    assert "metrics.jsonl" in commits[0][2]
+
+    # Save step 20: fails all 3 attempts -> MUST NOT crash; keeps local step_0000020 and prunes step_0000010!
+    fail_budget["remaining"] = 5
+    d2 = mgr.save(20, params, opt_state, {"step": 20}, tokenizer_dir=tok_dir, metrics_path=metrics_path)
+    assert d2.exists() and not d1.exists()
+
+    # Save step 30: succeeds cleanly -> does NOT re-upload tokenizer since already synced!
+    fail_budget["remaining"] = 0
+    d3 = mgr.save(30, params, opt_state, {"step": 30}, tokenizer_dir=tok_dir, metrics_path=metrics_path)
+    assert d3.exists() and not d2.exists()
+    assert len(commits) == 2
+    assert "tokenizer/tokenizer.pkl" not in commits[1][2]
+    assert "latest/model.npz" in commits[1][2]
+
+    # Verify BF16 round-trip load preserves exact values and dtypes
+    restored = mgr.load_latest(params, opt_state, p_sh, o_sh, pull_remote=False)
+    assert restored is not None
+    r_params, r_opt, r_state = restored
+    assert r_state["step"] == 30
+    assert r_params["wte"].dtype == jnp.bfloat16
+    assert bool(jnp.array_equal(r_params["wte"], params["wte"]))
+    assert bool(jnp.array_equal(r_opt["blocks"]["w_qkv"]["v_q"], opt_state["blocks"]["w_qkv"]["v_q"]))
+    # Sanity check _load_arrays directly
+    assert _load_arrays(d3 / "model")["wte"].dtype == jnp.bfloat16

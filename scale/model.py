@@ -1088,8 +1088,10 @@ def generate_tokens(
     batch_sharding=None,
 ) -> list[int]:
     """Autoregressive sampler for live qualitative checks during pretraining."""
-    # Sampling runs at batch=1 -> use safe XLA attention regardless of Splash/cuDNN training kernel
-    sample_spec = ModelSpec.from_dict({**spec.to_dict(), "attn_impl": "xla", "remat_policy": "none"})
+    # Sampling runs at batch=1 -> use safe XLA BF16 attention/GEMMs regardless of Splash/INT8 training kernels
+    sample_spec = ModelSpec.from_dict(
+        {**spec.to_dict(), "attn_impl": "xla", "remat_policy": "none", "matmul_quant": "none"}
+    )
     cos, sin = precompute_rotary_embeddings(
         sample_spec.sequence_len, sample_spec.head_dim, base=sample_spec.rope_base
     )
