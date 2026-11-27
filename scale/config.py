@@ -52,6 +52,10 @@ class ModelSpec:
     splash_block_size: int = 1024    # TPU Pallas SplashAttention VMEM tile size (auto-clamped to seq_len)
     matmul_quant: str = "none"       # Experimental linear GEMM quant: "none" | "int8" | "int8-all" | "fp8"
     scan_unroll: int = 1             # jax.lax.scan layer unroll factor (1 or 2 for pipeline overlap)
+    use_pallas_kernels: bool = True  # Auto-use Pallas Mosaic CutCE & VPU-quant kernels on TPU (clean fallback on GPU/CPU)
+    use_aligned_canon: bool = True   # Aligned causal depthwise conv4 (kills unaligned 2047/2046/2045 TPU HBM slices)
+    use_sharded_embed: bool = True   # Hidden-sharded all_to_all wte/value_embeds lookup (6x less ICI, 0 table all-reduce)
+    use_native_bhtd_attn: bool = True  # Native (B, H, T, D) layout across RoPE/QK-norm/SplashAttention (kills 4x copies/layer)
 
     def __post_init__(self) -> None:
         assert self.n_embd % self.n_head == 0, f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"
@@ -244,6 +248,7 @@ class TrainConfig:
     muon_beta2: float = 0.95
     muon_ns_steps: int = 5
     muon_vmap: bool = False           # False = low-HBM lax.scan; True = batched vmap (great on v5e-8 / G4!)
+    muon_layer_sharded: bool = True   # U-only Essential AI layer-sharded Split-Muon on multi-chip FSDP (114->0 AGs!)
     gate_adamw: bool = False          # Use AdamW (not Muon) for tiny gate tensors (ve_gate, w_attn_gate)
     split_muon: bool = True           # Qwen 3.8 Split-Muon: orthogonalize Q/K/V and gate/up independently!
     grad_clip: float = 1.0
@@ -266,6 +271,9 @@ class TrainConfig:
     sample_every: int = 500
     save_every: int = 500
     keep_last_checkpoints: int = 2
+    profile_dir: Optional[str] = None # Optional XProf trace output dir (`jax.profiler.trace`) for physical silicon profiling
+    profile_start_step: int = 3       # Session step index (1-based) to start XProf capture (after compile warmup)
+    profile_steps: int = 2            # Number of training steps to capture in XProf trace
 
     # Persistence / Remote Sync
     checkpoint_dir: str = "./checkpoints/1b"

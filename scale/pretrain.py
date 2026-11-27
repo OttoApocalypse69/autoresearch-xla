@@ -191,12 +191,16 @@ def _build_train_step(
         if use_loss_scale:
             leaves = jax.tree_util.tree_leaves(grads)
             all_finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(g)) for g in leaves]))
-            p_cand, st_cand, gnorm = optimizer_step(p, grads, st, lrm, muon_mom, muon_wd, spec, tcfg, ns_dtype)
+            p_cand, st_cand, gnorm = optimizer_step(
+                p, grads, st, lrm, muon_mom, muon_wd, spec, tcfg, ns_dtype, mesh=mesh
+            )
             p_next = jax.tree_util.tree_map(lambda a, b: jnp.where(all_finite, a, b), p_cand, p)
             st_next = jax.tree_util.tree_map(lambda a, b: jnp.where(all_finite, a, b), st_cand, st)
             return p_next, st_next, mean_ce, mean_z, gnorm, all_finite
 
-        p_next, st_next, gnorm = optimizer_step(p, grads, st, lrm, muon_mom, muon_wd, spec, tcfg, ns_dtype)
+        p_next, st_next, gnorm = optimizer_step(
+            p, grads, st, lrm, muon_mom, muon_wd, spec, tcfg, ns_dtype, mesh=mesh
+        )
         return p_next, st_next, mean_ce, mean_z, gnorm, jnp.bool_(True)
 
     return train_step
@@ -213,9 +217,8 @@ def run_benchmark(spec: ModelSpec, tcfg: TrainConfig, warmup_steps: int = 2, tim
     opt_dtype = jnp.bfloat16 if tcfg.opt_dtype == "bfloat16" else jnp.float32
     use_loss_scale = compute_dtype == jnp.float16
     ns_dtype = jnp.bfloat16 if compute_dtype == jnp.bfloat16 else jnp.float32
-    attn_used = resolve_attn_backend(spec.attn_impl)
-
     mesh = create_fsdp_mesh()
+    attn_used = resolve_attn_backend(spec.attn_impl, mesh=mesh)
     replicated = NamedSharding(mesh, P())
     step_sharding = NamedSharding(mesh, P(None, "fsdp", None))
 
@@ -252,10 +255,11 @@ def run_benchmark(spec: ModelSpec, tcfg: TrainConfig, warmup_steps: int = 2, tim
     flops_per_tok = estimate_flops_per_token(params, spec)
     peak_flops = hw.peak_tflops_total * 1e12
 
+    muon_mode = "layer-sharded" if (tcfg.muon_layer_sharded and mesh.size > 1) else ("vmap" if tcfg.muon_vmap else "scan")
     print(
         f"[Bench] {hw.device_kind} x{hw.num_devices} ({hw.platform}, {dtype_name}, peak={hw.peak_tflops_total:.1f} TFLOPS) | "
-        f"attn={attn_used} | remat={spec.remat_policy} | quant={spec.matmul_quant} | unroll={spec.scan_unroll} | "
-        f"p={tcfg.param_dtype} | opt={tcfg.opt_dtype} | muon={'vmap' if tcfg.muon_vmap else 'scan'}"
+        f"attn={attn_used} | remat={spec.remat_policy} | quant={spec.matmul_quant} | pallas={spec.use_pallas_kernels} | "
+        f"unroll={spec.scan_unroll} | p={tcfg.param_dtype} | opt={tcfg.opt_dtype} | muon={muon_mode}"
     )
     print(
         f"[Bench] {p_counts['total']/1e6:.2f}M params | FSDP: {p_sh['per_device_mb']:.0f}MB p + {o_sh['per_device_mb']:.0f}MB opt/dev | "
@@ -281,6 +285,18 @@ def run_benchmark(spec: ModelSpec, tcfg: TrainConfig, warmup_steps: int = 2, tim
         params, opt_state, ce_arr, _, _, _ = train_step(params, opt_state, x_dev, y_dev, lrm_d, mom_d, wd_d, sc_d)
         jax.block_until_ready(ce_arr)
     compile_s = time.perf_counter() - t_comp0
+
+    # Optional real-silicon XProf hardware trace capture (after compile warmup!)
+    if tcfg.profile_dir:
+        os.makedirs(tcfg.profile_dir, exist_ok=True)
+        print(f"[Profile] Capturing {tcfg.profile_steps} benchmark step(s) to {tcfg.profile_dir} ...", flush=True)
+        with jax.profiler.trace(tcfg.profile_dir):
+            for _ in range(max(1, tcfg.profile_steps)):
+                params, opt_state, ce_arr, _, gnorm_arr, _ = train_step(
+                    params, opt_state, x_dev, y_dev, lrm_d, mom_d, wd_d, sc_d
+                )
+            jax.block_until_ready(ce_arr)
+        print(f"[Profile] XProf trace saved to {tcfg.profile_dir}", flush=True)
 
     # True async pipelined timed window!
     t0 = time.perf_counter()
@@ -318,11 +334,11 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
     opt_dtype = jnp.bfloat16 if tcfg.opt_dtype == "bfloat16" else jnp.float32
     use_loss_scale = compute_dtype == jnp.float16
     ns_dtype = jnp.bfloat16 if compute_dtype == jnp.bfloat16 else jnp.float32
-    attn_used = resolve_attn_backend(spec.attn_impl)
     mix_pairs = parse_dataset_mix(tcfg.dataset)
     mix_desc = ", ".join(f"{src}:{w*100:.0f}%" for src, w in mix_pairs)
 
     mesh = create_fsdp_mesh()
+    attn_used = resolve_attn_backend(spec.attn_impl, mesh=mesh)
     replicated = NamedSharding(mesh, P())
     batch_sharding = NamedSharding(mesh, P("fsdp", None))
     step_sharding = NamedSharding(mesh, P(None, "fsdp", None))
@@ -344,10 +360,12 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
         remote_target=tcfg.remote_target,
     )
 
+    muon_mode = "layer-sharded" if (tcfg.muon_layer_sharded and mesh.size > 1) else ("vmap" if tcfg.muon_vmap else "scan")
     print(
         f"[Scale] Hardware: {hw.device_kind} x{hw.num_devices} "
         f"(platform={hw.platform}, compute={dtype_name}, param={tcfg.param_dtype}, opt={tcfg.opt_dtype}, "
-        f"attn={attn_used}, remat={spec.remat_policy}, quant={spec.matmul_quant}, fsdp={tcfg.use_fsdp}, peak={hw.peak_tflops_total:.1f} TFLOPS)"
+        f"attn={attn_used}, remat={spec.remat_policy}, quant={spec.matmul_quant}, pallas={spec.use_pallas_kernels}, "
+        f"muon={muon_mode}, fsdp={tcfg.use_fsdp}, peak={hw.peak_tflops_total:.1f} TFLOPS)"
     )
     print(f"[Scale] Dataset:  {tcfg.dataset} ({mix_desc})")
 
@@ -488,6 +506,7 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
     # Async pipelining window trackers (eliminates host-device sync bubbles between steps!)
     window_start = time.perf_counter()
     window_steps = 0
+    profile_active = False
 
     try:
         x_np, y_np, next_cur = next(loader)
@@ -512,6 +531,17 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
             muon_mom = compute_muon_momentum(step)
             muon_wd = compute_weight_decay(step, tcfg)
 
+            next_session_step = session_steps + 1
+            if tcfg.profile_dir and next_session_step == tcfg.profile_start_step:
+                os.makedirs(tcfg.profile_dir, exist_ok=True)
+                print(
+                    f"[Profile] Starting XProf trace at session step {next_session_step} "
+                    f"for {tcfg.profile_steps} step(s) -> {tcfg.profile_dir}",
+                    flush=True,
+                )
+                jax.profiler.start_trace(tcfg.profile_dir)
+                profile_active = True
+
             cur = next_cur
             active_cursor = cur
             params, opt_state, ce_arr, z_arr, gnorm_arr, finite_arr = train_step(
@@ -529,6 +559,12 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
             session_steps += 1
             window_steps += 1
             tokens_seen += total_batch_size
+
+            if profile_active and session_steps == tcfg.profile_start_step + max(1, tcfg.profile_steps) - 1:
+                jax.block_until_ready(ce_arr)
+                jax.profiler.stop_trace()
+                profile_active = False
+                print(f"[Profile] Stopped XProf trace -> {tcfg.profile_dir}", flush=True)
 
             # Decide whether we need to synchronize this step (logging, fp16 loss scale, eval, save, or warmup)
             should_log = session_steps <= 2 or (tcfg.log_every > 0 and step % tcfg.log_every == 0)
@@ -664,6 +700,12 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
     except KeyboardInterrupt:
         print("\n[Scale] Interrupted by user — saving final checkpoint before exit...")
     finally:
+        if profile_active:
+            try:
+                jax.profiler.stop_trace()
+            except Exception:
+                pass
+            profile_active = False
         gc.enable()
         signal.signal(signal.SIGTERM, old_sigterm)
         loader.close()
@@ -763,6 +805,8 @@ def main() -> None:
     )
     parser.add_argument("--opt-dtype", choices=["float32", "bfloat16"], default="float32")
     parser.add_argument("--muon-vmap", action="store_true", help="Batch Muon across layers via vmap (faster on v5e-8 / G4)")
+    parser.add_argument("--no-layer-sharded-muon", action="store_true", help="Disable U-only layer-sharded Split-Muon on multi-chip FSDP")
+    parser.add_argument("--no-pallas-kernels", action="store_true", help="Disable custom Pallas TPU Mosaic CutCE / SwiGLU / Quant kernels")
     parser.add_argument("--no-fsdp", action="store_true", help="Disable FSDP parameter sharding (replicate instead)")
     parser.add_argument("--phase", choices=["stable", "decay"], default="stable", help="WSD schedule phase")
     parser.add_argument("--warmup-steps", type=int, default=500)
@@ -783,6 +827,9 @@ def main() -> None:
     parser.add_argument("--sample-every", type=int, default=500)
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--keep-last-checkpoints", type=int, default=2, help="Local checkpoints retained on disk (use 1 on Kaggle 19.5 GB disk)")
+    parser.add_argument("--profile-dir", type=str, default=None, help="Optional directory for real-silicon XProf jax.profiler trace capture")
+    parser.add_argument("--profile-start-step", type=int, default=3, help="Session step (1-based) to begin XProf trace capture")
+    parser.add_argument("--profile-steps", type=int, default=2, help="Number of steps to record in XProf trace")
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/1b")
     parser.add_argument("--shard-cache-dir", type=str, default="/tmp/autoresearch_shards")
     parser.add_argument("--keep-shards", type=int, default=2, help="Max rolling shards kept on disk per source")
@@ -814,6 +861,8 @@ def main() -> None:
         arch_overrides["matmul_quant"] = args.matmul_quant
     if args.scan_unroll is not None:
         arch_overrides["scan_unroll"] = args.scan_unroll
+    if args.no_pallas_kernels:
+        arch_overrides["use_pallas_kernels"] = False
 
     spec = get_model_preset(args.preset, arch_overrides=arch_overrides or None)
 
@@ -829,6 +878,7 @@ def main() -> None:
         param_dtype=args.param_dtype,
         opt_dtype=args.opt_dtype,
         muon_vmap=args.muon_vmap,
+        muon_layer_sharded=not args.no_layer_sharded_muon,
         gate_adamw=args.gate_adamw,
         split_muon=args.split_muon,
         use_fsdp=not args.no_fsdp,
@@ -848,6 +898,9 @@ def main() -> None:
         sample_every=args.sample_every,
         save_every=args.save_every,
         keep_last_checkpoints=args.keep_last_checkpoints,
+        profile_dir=args.profile_dir,
+        profile_start_step=args.profile_start_step,
+        profile_steps=args.profile_steps,
         checkpoint_dir=args.checkpoint_dir,
         sync_backend=args.sync_backend,
         remote_target=args.remote_target,
