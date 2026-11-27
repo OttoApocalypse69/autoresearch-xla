@@ -1200,7 +1200,7 @@ def forward_scalar_loss_and_z(
 
     B, T, C = x.shape
     V = lm_w.shape[1]
-    if spec.use_pallas_kernels and can_use_pallas_cutce(B, T, C, V, mesh, compute_dtype):
+    if spec.use_pallas_cutce and spec.use_pallas_kernels and can_use_pallas_cutce(B, T, C, V, mesh, compute_dtype):
         lm_shard_ax = 0 if spec.tie_embeddings else 1
         pallas_ce_fn = make_pallas_cutce_fn(
             spec.softcap, spec.z_loss_weight, mesh=mesh, lm_w_shard_axis=lm_shard_ax
