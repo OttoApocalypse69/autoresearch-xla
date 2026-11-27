@@ -207,6 +207,8 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
         loss_chunk_size=2048,
     ),
 }
+# Chonky Dense Boi™ (CDB™) alias for 1b-ve!
+MODEL_PRESETS["cdb"] = MODEL_PRESETS["1b-ve"]
 
 
 def get_model_preset(name: str, arch_overrides: Optional[dict] = None) -> ModelSpec:
@@ -272,6 +274,7 @@ class TrainConfig:
     sample_every: int = 500
     save_every: int = 500
     keep_last_checkpoints: int = 2
+    watchdog_enabled: bool = True     # Auto-abort compromised/diverging runs & protect last healthy checkpoint!
     profile_dir: Optional[str] = None # Optional XProf trace output dir (`jax.profiler.trace`) for physical silicon profiling
     profile_start_step: int = 3       # Session step index (1-based) to start XProf capture (after compile warmup)
     profile_steps: int = 2            # Number of training steps to capture in XProf trace

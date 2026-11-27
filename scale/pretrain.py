@@ -47,6 +47,7 @@ if os.path.exists("/dev/nvidia0") and not os.environ.get("XLA_PYTHON_CLIENT_MEM_
 
 import argparse
 import functools
+from collections import deque
 import gc
 import json
 import math
@@ -95,6 +96,132 @@ jax.config.update("jax_compilation_cache_dir", JAX_CACHE_DIR)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 2.0)
 
 SAMPLE_PROMPT = "The key insight behind scaling neural networks is"
+
+
+class TrainingInstabilityError(RuntimeError):
+    """Raised when TrainingWatchdog detects divergence/regression to abort early and preserve TPU quota."""
+
+
+class TrainingWatchdog:
+    """
+    Zero-overhead host-side instability detector & HF checkpoint protector:
+      1. Hard blowup: NaN/Inf in loss, z_loss, or grad_norm; ce > 20 or z > 1000 after step 50.
+      2. Pinned val_bpb regression: immediate abort if val_bpb jumps > +0.12 above best_val_bpb
+         (or > +0.06 for 2 consecutive evals once best_val_bpb < 3.0).
+      3. Sustained grad_norm explosion + rising train loss EMA: aborts if median grad_norm over
+         5 consecutive log windows exceeds max(1.5, 4.0 * baseline_gnorm) AND loss EMA is > +0.30
+         nats above its best EMA (immune to single noisy batches / shard boundaries!).
+      4. Sustained train loss jump: aborts if loss EMA stays > +0.85 nats above best EMA for 5
+         consecutive log windows.
+      5. Checkpoint protection (`is_degraded`): prevents overwriting `latest/` on HF Hub with
+         compromised weights when val_bpb or train loss has regressed.
+    """
+
+    def __init__(self, best_val_bpb: float = float("inf"), enabled: bool = True):
+        self.enabled = enabled
+        self.tripped = False
+        self.best_val_bpb = best_val_bpb
+        self.consec_val_regress = 0
+        self.last_val_regressed = False
+        self.loss_ema: Optional[float] = None
+        self.best_loss_ema = float("inf")
+        self.baseline_gnorm_ema: Optional[float] = None
+        self.recent_gnorms: deque[float] = deque(maxlen=5)
+        self.consec_loss_high = 0
+
+    @property
+    def is_degraded(self) -> bool:
+        if not self.enabled:
+            return False
+        if self.tripped or self.last_val_regressed:
+            return True
+        if self.loss_ema is not None and math.isfinite(self.best_loss_ema):
+            if self.loss_ema > self.best_loss_ema + 0.30:
+                return True
+        return False
+
+    def _trip(self, reason: str) -> str:
+        self.tripped = True
+        return reason
+
+    def check_step(self, step: int, ce_f: float, z_f: float, gnorm_f: float) -> Optional[str]:
+        if not self.enabled:
+            return None
+        if not (math.isfinite(ce_f) and math.isfinite(z_f) and math.isfinite(gnorm_f)):
+            return self._trip(f"Non-finite metric at step {step} (loss={ce_f}, z={z_f}, gnorm={gnorm_f})")
+        if step >= 50 and ce_f > 20.0:
+            return self._trip(f"Train loss blowup at step {step} (loss={ce_f:.3f} > 20.0)")
+        if step >= 50 and z_f > 1000.0:
+            return self._trip(f"Logit z-loss blowup at step {step} (z={z_f:.1f} > 1000.0)")
+
+        self.loss_ema = ce_f if self.loss_ema is None else (0.2 * ce_f + 0.8 * self.loss_ema)
+        if step >= 50 and self.loss_ema < self.best_loss_ema:
+            self.best_loss_ema = self.loss_ema
+
+        # Track calm baseline gnorm only while training is healthy
+        if self.baseline_gnorm_ema is None:
+            self.baseline_gnorm_ema = gnorm_f
+        elif not math.isfinite(self.best_loss_ema) or self.loss_ema <= self.best_loss_ema + 0.15:
+            self.baseline_gnorm_ema = 0.05 * gnorm_f + 0.95 * self.baseline_gnorm_ema
+
+        self.recent_gnorms.append(gnorm_f)
+
+        if step >= 200 and math.isfinite(self.best_loss_ema):
+            if len(self.recent_gnorms) == 5:
+                med_gn = sorted(self.recent_gnorms)[2]
+                thresh = max(1.5, 4.0 * max(self.baseline_gnorm_ema, 0.1))
+                if med_gn > thresh and self.loss_ema > self.best_loss_ema + 0.30:
+                    return self._trip(
+                        f"Sustained grad_norm explosion + loss regression at step {step}: "
+                        f"median_gnorm={med_gn:.2f} > {thresh:.2f} (base={self.baseline_gnorm_ema:.2f}), "
+                        f"loss_ema={self.loss_ema:.3f} vs best={self.best_loss_ema:.3f}"
+                    )
+            if self.loss_ema > self.best_loss_ema + 0.85:
+                self.consec_loss_high += 1
+                if self.consec_loss_high >= 5:
+                    return self._trip(
+                        f"Sustained train loss jump at step {step}: "
+                        f"loss_ema={self.loss_ema:.3f} > best={self.best_loss_ema:.3f} + 0.85 for 5 windows"
+                    )
+            else:
+                self.consec_loss_high = 0
+        return None
+
+    def check_eval(self, step: int, val_bpb: float) -> Optional[str]:
+        if not self.enabled:
+            if val_bpb < self.best_val_bpb:
+                self.best_val_bpb = val_bpb
+            return None
+        if not math.isfinite(val_bpb):
+            self.last_val_regressed = True
+            return self._trip(f"Non-finite val_bpb={val_bpb} at step {step}")
+
+        reason: Optional[str] = None
+        if math.isfinite(self.best_val_bpb) and self.best_val_bpb < 3.0:
+            delta = val_bpb - self.best_val_bpb
+            self.last_val_regressed = delta > 0.05
+            if delta > 0.12:
+                reason = self._trip(
+                    f"Severe val_bpb regression at step {step}: "
+                    f"val_bpb={val_bpb:.6f} vs best={self.best_val_bpb:.6f} (+{delta:.4f} > +0.12)"
+                )
+            elif delta > 0.06:
+                self.consec_val_regress += 1
+                if self.consec_val_regress >= 2:
+                    reason = self._trip(
+                        f"Consecutive val_bpb regression at step {step}: "
+                        f"val_bpb={val_bpb:.6f} vs best={self.best_val_bpb:.6f} (+{delta:.4f} for 2 evals)"
+                    )
+            elif delta <= 0.03:
+                self.consec_val_regress = 0
+        else:
+            self.last_val_regressed = False
+
+        if val_bpb < self.best_val_bpb:
+            self.best_val_bpb = val_bpb
+            self.consec_val_regress = 0
+            self.last_val_regressed = False
+        return reason
 
 
 def _resolve_compute_dtype(tcfg: TrainConfig, hw_dtype_name: str):
@@ -507,6 +634,8 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
     window_start = time.perf_counter()
     window_steps = 0
     profile_active = False
+    watchdog = TrainingWatchdog(best_val_bpb=best_val_bpb, enabled=tcfg.watchdog_enabled)
+    instability_reason: Optional[str] = None
 
     try:
         x_np, y_np, next_cur = next(loader)
@@ -600,7 +729,8 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
                         good_scale_steps = 0
 
                 if math.isnan(ce_f) or math.isinf(ce_f):
-                    raise RuntimeError(f"Training diverged (loss={ce_f}) at step {step}")
+                    instability_reason = f"Training diverged (loss={ce_f}) at step {step}"
+                    raise TrainingInstabilityError(instability_reason)
 
                 if should_log:
                     dt = (now - window_start) / max(window_steps, 1)
@@ -633,6 +763,11 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
                     )
                     window_start = time.perf_counter()
                     window_steps = 0
+
+                    wd_reason = watchdog.check_step(step, ce_f, z_f, gnorm_f)
+                    if wd_reason is not None:
+                        instability_reason = wd_reason
+                        raise TrainingInstabilityError(wd_reason)
 
             if session_steps == 2:
                 gc.collect()
@@ -668,18 +803,30 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
                 window_start = time.perf_counter()
                 window_steps = 0
 
+                wd_eval_reason = watchdog.check_eval(step, val_bpb)
+                if wd_eval_reason is not None:
+                    instability_reason = wd_eval_reason
+                    raise TrainingInstabilityError(wd_eval_reason)
+
             if should_save:
-                gc.enable()
-                ckpt_mgr.save(
-                    step=step,
-                    params=params,
-                    opt_state=opt_state,
-                    trainer_state=make_trainer_state(),
-                    tokenizer_dir=tokenizer_dir,
-                    metrics_path=metrics_path,
-                )
-                last_saved_step = step
-                gc.disable()
+                if watchdog.is_degraded:
+                    print(
+                        f"  >>> [Watchdog] Skipping checkpoint save at step {step} (run degraded) "
+                        f"to preserve last healthy checkpoint at step {last_saved_step}!",
+                        flush=True,
+                    )
+                else:
+                    gc.enable()
+                    ckpt_mgr.save(
+                        step=step,
+                        params=params,
+                        opt_state=opt_state,
+                        trainer_state=make_trainer_state(),
+                        tokenizer_dir=tokenizer_dir,
+                        metrics_path=metrics_path,
+                    )
+                    last_saved_step = step
+                    gc.disable()
                 window_start = time.perf_counter()
                 window_steps = 0
 
@@ -697,6 +844,14 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
                 window_start = time.perf_counter()
                 window_steps = 0
 
+    except TrainingInstabilityError as exc:
+        print("\n" + "!" * 78, flush=True)
+        print(f"[Watchdog] AUTO-ABORTING COMPROMISED RUN TO SAVE TPU QUOTA!", flush=True)
+        print(f"  Reason:                 {exc}", flush=True)
+        print(f"  Last healthy saved step:{last_saved_step} (best_val_bpb={best_val_bpb:.6f})", flush=True)
+        print(f"  Remote HF latest/ left 100% UNTOUCHED (no corrupted checkpoint uploaded).", flush=True)
+        print("!" * 78 + "\n", flush=True)
+        raise
     except KeyboardInterrupt:
         print("\n[Scale] Interrupted by user — saving final checkpoint before exit...")
     finally:
@@ -710,7 +865,7 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
         signal.signal(signal.SIGTERM, old_sigterm)
         loader.close()
 
-    if session_steps > 0:
+    if session_steps > 0 and instability_reason is None:
         last_val_bpb = evaluate_val_bpb(
             eval_loss_fn=eval_loss_fn,
             params=params,
@@ -727,7 +882,7 @@ def run_pretrain(spec: ModelSpec, tcfg: TrainConfig) -> dict:
             best_val_bpb = last_val_bpb
         _append_metric(metrics_path, {"step": step, "tokens_seen": tokens_seen, "val_bpb": round(last_val_bpb, 6)})
 
-        if step > last_saved_step:
+        if step > last_saved_step and not watchdog.is_degraded:
             ckpt_mgr.save(
                 step=step,
                 params=params,
@@ -829,6 +984,7 @@ def main() -> None:
     parser.add_argument("--sample-every", type=int, default=500)
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--keep-last-checkpoints", type=int, default=2, help="Local checkpoints retained on disk (use 1 on Kaggle 19.5 GB disk)")
+    parser.add_argument("--no-watchdog", action="store_true", help="Disable automatic divergence/regression abort & checkpoint protection watchdog")
     parser.add_argument("--profile-dir", type=str, default=None, help="Optional directory for real-silicon XProf jax.profiler trace capture")
     parser.add_argument("--profile-start-step", type=int, default=3, help="Session step (1-based) to begin XProf trace capture")
     parser.add_argument("--profile-steps", type=int, default=2, help="Number of steps to record in XProf trace")
@@ -905,6 +1061,7 @@ def main() -> None:
         sample_every=args.sample_every,
         save_every=args.save_every,
         keep_last_checkpoints=args.keep_last_checkpoints,
+        watchdog_enabled=not args.no_watchdog,
         profile_dir=args.profile_dir,
         profile_start_step=args.profile_start_step,
         profile_steps=args.profile_steps,

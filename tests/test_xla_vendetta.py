@@ -256,3 +256,44 @@ def test_xprof_profiler_hook_runs_cleanly(tmp_path):
     assert prof_dir.exists()
     assert any(prof_dir.rglob("*")), f"Expected XProf trace files inside {prof_dir}"
 
+
+def test_training_watchdog_and_cdb_alias():
+    """Verify TrainingWatchdog catches real Session-1-style instability with zero false positives, and 'cdb' aliases '1b-ve'."""
+    from scale.config import get_model_preset
+    from scale.pretrain import TrainingWatchdog
+
+    # 1. Chonky Dense Boi (cdb) alias equals 1b-ve identically
+    assert get_model_preset("cdb").to_dict() == get_model_preset("1b-ve").to_dict()
+
+    # 2. Healthy noisy training with single-batch spikes & small val wobble -> ZERO false positives
+    wd_ok = TrainingWatchdog(enabled=True)
+    for step in range(10, 1000, 10):
+        gn = 2.8 if step in (310, 620) else 0.22
+        loss = 4.2 if step == 620 else max(2.8, 5.5 - step * 0.0025)
+        assert wd_ok.check_step(step, loss, 220.0, gn) is None
+    assert wd_ok.check_eval(250, 1.35) is None
+    assert wd_ok.check_eval(500, 1.18) is None
+    assert wd_ok.check_eval(750, 1.20) is None  # tiny +0.02 wobble is fine
+    assert not wd_ok.is_degraded
+
+    # 3. Exact replay of Session 1 val_bpb regression (1.1526 -> 1.2953 = +0.143) -> ABORTS immediately & blocks save!
+    wd_s1 = TrainingWatchdog(enabled=True)
+    assert wd_s1.check_eval(500, 1.21) is None
+    assert wd_s1.check_eval(750, 1.152586) is None
+    reason = wd_s1.check_eval(1250, 1.295291)
+    assert reason is not None and "Severe val_bpb regression" in reason
+    assert wd_s1.is_degraded
+
+    # 4. Sustained gnorm explosion + rising train loss EMA -> ABORTS within 5 log windows!
+    wd_gn = TrainingWatchdog(enabled=True)
+    for step in range(50, 500, 10):
+        assert wd_gn.check_step(step, 3.4, 240.0, 0.20) is None
+    aborted = None
+    for step in range(500, 600, 10):
+        aborted = wd_gn.check_step(step, 4.1, 280.0, 2.2)
+        if aborted:
+            break
+    assert aborted is not None and "Sustained grad_norm explosion" in aborted
+    assert wd_gn.is_degraded
+
+
