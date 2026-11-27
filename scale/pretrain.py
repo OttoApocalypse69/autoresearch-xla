@@ -806,7 +806,8 @@ def main() -> None:
     parser.add_argument("--opt-dtype", choices=["float32", "bfloat16"], default="float32")
     parser.add_argument("--muon-vmap", action="store_true", help="Batch Muon across layers via vmap (faster on v5e-8 / G4)")
     parser.add_argument("--no-layer-sharded-muon", action="store_true", help="Disable U-only layer-sharded Split-Muon on multi-chip FSDP")
-    parser.add_argument("--no-pallas-kernels", action="store_true", help="Disable custom Pallas TPU Mosaic SwiGLU+Quant kernel")
+    parser.add_argument("--pallas-kernels", action="store_true", help="Opt-in custom Pallas TPU Mosaic SwiGLU+Quant kernel")
+    parser.add_argument("--no-pallas-kernels", action="store_true", help="Explicitly disable custom Pallas TPU Mosaic kernels")
     parser.add_argument("--pallas-cutce", action="store_true", help="Opt-in Zero-HBM-Logits BF16 Pallas CutCE (saves ~1 GB HBM)")
     parser.add_argument("--no-fsdp", action="store_true", help="Disable FSDP parameter sharding (replicate instead)")
     parser.add_argument("--phase", choices=["stable", "decay"], default="stable", help="WSD schedule phase")
@@ -862,10 +863,13 @@ def main() -> None:
         arch_overrides["matmul_quant"] = args.matmul_quant
     if args.scan_unroll is not None:
         arch_overrides["scan_unroll"] = args.scan_unroll
+    if args.pallas_kernels:
+        arch_overrides["use_pallas_kernels"] = True
     if args.no_pallas_kernels:
         arch_overrides["use_pallas_kernels"] = False
     if args.pallas_cutce:
         arch_overrides["use_pallas_cutce"] = True
+        arch_overrides["use_pallas_kernels"] = True
 
     spec = get_model_preset(args.preset, arch_overrides=arch_overrides or None)
 

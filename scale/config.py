@@ -52,10 +52,10 @@ class ModelSpec:
     splash_block_size: int = 1024    # TPU Pallas SplashAttention VMEM tile size (auto-clamped to seq_len)
     matmul_quant: str = "none"       # Experimental linear GEMM quant: "none" | "int8" | "int8-all" | "fp8"
     scan_unroll: int = 1             # jax.lax.scan layer unroll factor (1 or 2 for pipeline overlap)
-    use_pallas_kernels: bool = True  # Auto-use real-silicon-verified Pallas Mosaic SwiGLU+Quant kernel on TPU (1.64x faster)
-    use_pallas_cutce: bool = False   # Opt-in Zero-HBM-Logits BF16 Pallas CutCE (slower than INT8-bwd XLA CutCE on v5e; saves ~1 GB HBM)
-    use_aligned_canon: bool = True   # Aligned causal depthwise conv4 (faster on v5e-1; kills unaligned 2047/2046/2045 slices)
-    use_sharded_embed: bool = True   # Hidden-sharded all_to_all wte/value_embeds lookup (6x less ICI, 0 table all-reduce)
+    use_pallas_kernels: bool = False  # Opt-in custom Pallas Mosaic SwiGLU+Quant (pure XLA hits 63.71% vs 62.32% MFU end-to-end on v5e-1)
+    use_pallas_cutce: bool = False    # Opt-in Zero-HBM-Logits BF16 Pallas CutCE (slower than INT8-bwd XLA CutCE on v5e; saves ~1 GB HBM)
+    use_aligned_canon: bool = True    # Aligned causal depthwise conv4 (faster on v5e-1; kills unaligned 2047/2046/2045 slices)
+    use_sharded_embed: bool = True    # Hidden-sharded all_to_all wte/value_embeds lookup (6x less ICI, 0 table all-reduce)
     use_native_bhtd_attn: bool = False  # Optional (B, H, T, D) layout (disabled by default: +48.5ms slower on real v5e-1 silicon)
 
     def __post_init__(self) -> None:
